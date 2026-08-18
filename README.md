@@ -1,5 +1,7 @@
 # ComfyUI ALL-in-ONE MiniMax H3
 
+> Personal independent fork of LeonQ8/ComfyUI-ALLinONE-MinimaxH3
+
 ![Status: Beta](https://img.shields.io/badge/status-beta-orange)
 ![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue)
 

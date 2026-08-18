@@ -11,9 +11,8 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/LeonQ8/ComfyUI-ALLinONE-MinimaxH3"
-Documentation = "https://github.com/LeonQ8/ComfyUI-ALLinONE-MinimaxH3#readme"
+Repository = "https://github.com/ysamtme/ComfyUI-ALLinONE-MinimaxH3"
+Documentation = "https://github.com/ysamtme/ComfyUI-ALLinONE-MinimaxH3#readme"
 
 [tool.comfy]
-PublisherId = "leon"
 DisplayName = "ALL in ONE MiniMaxH3"
