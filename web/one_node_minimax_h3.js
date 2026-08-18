@@ -856,6 +856,13 @@ app.registerExtension({
       });
     };
 
+    const originalOnConfigure=nodeType.prototype.onConfigure;
+    nodeType.prototype.onConfigure=function(){
+      originalOnConfigure?.apply(this,arguments);
+      const stalePrompt=this.inputs?.findIndex(input=>input?.name==="prompt")??-1;
+      if(stalePrompt>=0)this.removeInput(stalePrompt);
+    };
+
     nodeType.prototype.onResize=function(){
       const slotH=(typeof LiteGraph!=="undefined"&&LiteGraph.NODE_SLOT_HEIGHT)||20;
       this.size=[NODE_W,NODE_H+slotH*3];
@@ -1013,7 +1020,7 @@ app.registerExtension({
           playOnFinish:S.playOnFinish,folded:S.folded,livePreview:S.livePreview,
           imgSub:S.imgSub,imgAspect:S.imgAspect,imgMP:S.imgMP,imgW:S.imgW,imgH:S.imgH,
           imgProfile:S.imgProfile,imgRefs:S.imgRefs,
-        });
+        },self);
       }
 
       const _foldState=S.folded||{};
