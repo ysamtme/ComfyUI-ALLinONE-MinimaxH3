@@ -86,9 +86,76 @@ const DEFAULT_MODELS = {
   upscaleVae:"none",
 };
 
+const UPSCALE_TEMPORAL = {
+  Fast:     {batch:5, overlap:2},
+  Balanced: {batch:13,overlap:3},
+  Stable:   {batch:21,overlap:4},
+  Maximum:  {batch:33,overlap:4},
+};
+const UPSCALE_COLOR = {LAB:"lab",Wavelet:"wavelet","Wavelet adaptive":"wavelet_adaptive",None:"none"};
+const UPSCALE_TILING = ["Auto","Off","1024","768","512"];
+
 function snapFrames(seconds){
   const base = Math.max(5, Math.round(seconds * 24));
   return base + ((5 - (base % 17)) + 17) % 17;
+}
+
+function guideFrameIndex(guide,totalFrames){
+  const value=Number(guide.at);
+  const raw=guide.unit==="frame"?value-1:value*24;
+  return Math.max(0,Math.min(Math.max(0,totalFrames-1),Math.round(Number.isFinite(raw)?raw:0)));
+}
+console.assert(guideFrameIndex({unit:"seconds",at:3.88},362)===93&&guideFrameIndex({unit:"frame",at:94},362)===93,"[H3One] guide timing self-check failed");
+
+function fitResolutionToAspect(sourceWidth,sourceHeight,targetWidth,targetHeight){
+  const ratio=Number(sourceWidth)/Number(sourceHeight),targetPixels=Number(targetWidth)*Number(targetHeight);
+  if(!(ratio>0)||!(targetPixels>0)) return {width:targetWidth,height:targetHeight};
+  let best=null;
+  for(let width=32;width<=1344;width+=32){
+    for(let height=32;height<=1344;height+=32){
+      const aspectError=Math.abs(Math.log((width/height)/ratio));
+      const areaError=Math.abs(Math.log((width*height)/targetPixels));
+      const score=aspectError*8+areaError;
+      if(!best||score<best.score) best={width,height,score};
+    }
+  }
+  return {width:best.width,height:best.height};
+}
+{const r=fitResolutionToAspect(1501,2000,1344,768);console.assert(r.width===864&&r.height===1152,"[H3One] fit-resolution self-check failed");}
+
+function upscaleTarget(sourceWidth,sourceHeight,factor){
+  const width=Number(sourceWidth),height=Number(sourceHeight),scaleFactor=Number(factor);
+  if(!(width>0)||!(height>0)||!(scaleFactor>0)) return null;
+  const short=Math.min(width,height);
+  const shortTarget=Math.max(16,Math.round(short*scaleFactor/2)*2);
+  const scale=shortTarget/short;
+  const even=v=>Math.max(2,Math.floor(v/2)*2);
+  return {
+    width:width<=height?shortTarget:even(width*scale),
+    height:height<=width?shortTarget:even(height*scale),
+    shortEdge:shortTarget,
+  };
+}
+{const r=upscaleTarget(864,1152,1.5);console.assert(r&&r.width===1296&&r.height===1728&&r.shortEdge===1296,"[H3One] upscale-size self-check failed");}
+
+function resolveUpscaleTiling(mode,target,temporal){
+  if(mode==="Off"||!target) return {encode:false,decode:false,size:1024,label:"Off"};
+  if(mode!=="Auto"){
+    const size=Number(mode)||1024;
+    return {encode:true,decode:true,size,label:`${size}px encode+decode`};
+  }
+  const megapixels=target.width*target.height/1e6;
+  const pressure=megapixels*(temporal?.batch||13);
+  if(pressure<20) return {encode:false,decode:false,size:1024,label:"Auto → Off"};
+  const encode=pressure>=32;
+  const size=pressure>=90?512:pressure>=56?768:1024;
+  return {encode,decode:true,size,label:`Auto → ${size}px ${encode?"encode+decode":"decode"}`};
+}
+{
+  const stable=resolveUpscaleTiling("Auto",upscaleTarget(864,1152,1.5),UPSCALE_TEMPORAL.Stable);
+  const balanced=resolveUpscaleTiling("Auto",upscaleTarget(864,1152,1.5),UPSCALE_TEMPORAL.Balanced);
+  const heavy=resolveUpscaleTiling("Auto",upscaleTarget(864,1152,2.25),UPSCALE_TEMPORAL.Balanced);
+  console.assert(stable.decode&&stable.encode&&stable.size===1024&&balanced.decode&&!balanced.encode&&balanced.size===1024&&heavy.decode&&heavy.encode&&heavy.size===768,"[H3One] upscale-tiling self-check failed");
 }
 
 // -- DOM helpers (adapted from the One Node family) ----------------------------
@@ -348,7 +415,7 @@ function mkRmBtn(){
   return b;
 }
 
-function ImgSlot(optional,onFile){
+function ImgSlot(optional,onFile,onDimensions){
   const wrap=mk("div",{
     width:"72px",height:"72px",borderRadius:"12px",
     border:`1.5px dashed ${C.border}`,background:C.bg2,
@@ -380,9 +447,16 @@ function ImgSlot(optional,onFile){
     position:"absolute",inset:"0",width:"100%",height:"100%",
     objectFit:"cover",display:"none",borderRadius:"11px",
   });
+  const dimensions=mk("div",{
+    position:"absolute",left:"4px",right:"4px",bottom:"4px",zIndex:"2",
+    display:"none",padding:"2px 3px",borderRadius:"4px",
+    background:"rgba(0,0,0,.78)",color:"rgba(255,255,255,.9)",
+    fontSize:"7px",fontWeight:"700",lineHeight:"1.2",textAlign:"center",
+    letterSpacing:".02em",pointerEvents:"none",whiteSpace:"nowrap",
+  });
   const rm=mkRmBtn();
   const inp=mk("input",{display:"none"},{type:"file",accept:"image/*"});
-  wrap.append(icoWrap,prevEl,rm,inp);
+  wrap.append(icoWrap,prevEl,dimensions,rm,inp);
   wrap.onmouseenter=()=>{wrap.style.borderColor=C.lime;};
   wrap.onmouseleave=()=>{wrap.style.borderColor=C.border;};
   wrap.onclick=()=>inp.click();
@@ -396,6 +470,13 @@ function ImgSlot(optional,onFile){
   });
   let _currentName=null;
   const _showLoaded=(src,fname)=>{
+    dimensions.style.display="none";
+    prevEl.onload=()=>{
+      const w=prevEl.naturalWidth,h=prevEl.naturalHeight;
+      if(w&&h){tx(dimensions,`${w}×${h}`);dimensions.title=`Original image: ${w}×${h}`;dimensions.style.display="block";}
+      if(onDimensions) onDimensions(w,h);
+    };
+    prevEl.onerror=()=>{dimensions.style.display="none";};
     prevEl.src=src;prevEl.style.display="block";
     icoWrap.style.display="none";rm.style.display="flex";
     wrap.style.borderColor=C.lime;
@@ -414,8 +495,10 @@ function ImgSlot(optional,onFile){
   rm.onclick=e=>{
     e.stopPropagation();
     prevEl.src="";prevEl.style.display="none";
-    rm.style.display="none";icoWrap.style.display="flex";
-    wrap.style.borderColor=C.border;inp.value="";_currentName=null;onFile(null);
+    dimensions.style.display="none";rm.style.display="none";icoWrap.style.display="flex";
+    wrap.style.borderColor=C.border;inp.value="";_currentName=null;
+    if(onDimensions) onDimensions(null,null);
+    onFile(null);
   };
   const _restorePreview=(name)=>{
     if(!name) return;
@@ -628,6 +711,7 @@ let _activeShowLatest=null;
 let _activeShownFiles=[];
 let _batchIds=[];
 let _batchDone=0;
+const _batchCompleted=new Set();
 let _listenersRegistered=false;
 let _finishWatchTimer=null;
 let _finishDone=false;
@@ -649,18 +733,26 @@ const _armFinishWatch=()=>{
       const h=await r.json();
       if(h&&h[_activePromptId]){
         _stopFinishWatch();
-        _batchDone=_batchIds.length;
+        const activeIndex=_batchIds.indexOf(_activePromptId);
+        _batchIds.slice(0,activeIndex+1).forEach(id=>_batchCompleted.add(id));
         _finishRun();
       }
     }catch(e){}
   },2500);
 };
-const _finishRun=async()=>{
+const _finishRun=async(promptId)=>{
   if(_finishDone) return;
   if(!_activeNode) return;
   if(_activeNode._h3_S && _activeNode._h3_S.generating!==true) return;
+  if(promptId){
+    if(!_batchIds.includes(promptId)||_batchCompleted.has(promptId)) return;
+    _batchCompleted.add(promptId);
+  }else if(_batchCompleted.size<_batchIds.length){
+    const next=_batchIds.find(id=>!_batchCompleted.has(id));
+    if(next) _batchCompleted.add(next);
+  }
   if(_batchIds.length){
-    _batchDone++;
+    _batchDone=_batchCompleted.size;
     if(_batchDone<_batchIds.length){
       _activeSetStage?.(`Done ${_batchDone}/${_batchIds.length}`,Math.round(_batchDone/_batchIds.length*100));
       return;
@@ -673,11 +765,12 @@ const _finishRun=async()=>{
   _activeShowTime?.(_elapsed);
   let tries=0;
   while(tries<12&&!_activeShownFiles.length){
-    await _activeShowLatest?.();
+    await _activeShowLatest?.(_activePromptId);
     if(_activeShownFiles.length) break;
     tries++;
     await new Promise(res=>setTimeout(res,1500));
   }
+  if(_batchCompleted.size<_batchIds.length){ _finishDone=false; return; }
   _activeResetBtn?.();
   const S=_activeNode?._h3_S;
   if(S && S.soundEnabled!==false && S.sound!=="off") playDone(S.sound||"chime");
@@ -756,12 +849,27 @@ app.registerExtension({
           loras:          (()=>{ const arr=Array.isArray(saved.loras)?saved.loras:[]; const named=arr.filter(l=>l&&l.name); return named.concat([{name:"",strength:1}]); })(),
           firstFrame:      saved.firstFrame||null,
           lastFrame:       saved.lastFrame||null,
+          firstFrameSize:  saved.firstFrameSize||null,
+          lastFrameSize:   saved.lastFrameSize||null,
+          i2vGuides:       (Array.isArray(saved.i2vGuides)?saved.i2vGuides:[]).slice(0,32).map(g=>({
+            img:g&&g.img||null,
+            enabled:!g||g.enabled!==false,
+            unit:g&&g.unit==="frame"?"frame":"seconds",
+            at:Number.isFinite(Number(g&&g.at))?Number(g.at):3.5,
+            orientation:g&&["landscape","portrait"].includes(g.orientation)?g.orientation:null,
+            width:Number(g&&g.width)||null,
+            height:Number(g&&g.height)||null,
+          })),
+          firstFrameOrientation: saved.firstFrameOrientation||null,
+          lastFrameOrientation:  saved.lastFrameOrientation||null,
+          resOrientation:  ["auto","landscape","portrait"].includes(saved.resOrientation)?saved.resOrientation:"auto",
           refImages:       Array.isArray(saved.refImages)?saved.refImages:[],
+          refImageSizes:   saved.refImageSizes&&typeof saved.refImageSizes==="object"?saved.refImageSizes:{},
           refVideos:       (Array.isArray(saved.refVideos)?saved.refVideos:[]).map(v=>(typeof v==="string")?{name:v,useAudio:false}:{name:(v&&v.name)||"",useAudio:!!(v&&v.useAudio)}),
           refAudios:       Array.isArray(saved.refAudios)?saved.refAudios:[],
           audioFile:       saved.audioFile||null,
           extendVideo:     saved.extendVideo||null,
-          kf:              (Array.isArray(saved.kf)&&saved.kf.length)?saved.kf.map(k=>({img:k.img||null,pos:k.pos||0})):[{img:null,pos:1},{img:null,pos:62},{img:null,pos:124}],
+          kf:              (Array.isArray(saved.kf)&&saved.kf.length)?saved.kf.map(k=>({img:k.img||null,pos:k.pos||0,width:Number(k.width)||null,height:Number(k.height)||null})):[{img:null,pos:1,width:null,height:null},{img:null,pos:62,width:null,height:null},{img:null,pos:124,width:null,height:null}],
           chainClips:      Array.isArray(saved.chainClips)&&saved.chainClips.length? saved.chainClips : [{prompt:"",duration:5},{prompt:"",duration:5}],
           models:          Object.assign({}, DEFAULT_MODELS, saved.models||{}),
           speedLora:       saved.speedLora||"",
@@ -772,8 +880,12 @@ app.registerExtension({
           mcLength:        saved.mcLength!==undefined?saved.mcLength:22,
           customW:         saved.customW||960,
           customH:         saved.customH||544,
-          upscaleFactor:   saved.upscaleFactor||2,
+          resFitAspect:    saved.resFitAspect===true,
+          upscaleFactor:   Number(saved.upscaleFactor)||1.5,
           upscaleMethod:   saved.upscaleMethod||"seedvr",
+          upscaleTemporal: UPSCALE_TEMPORAL[saved.upscaleTemporal]?saved.upscaleTemporal:"Balanced",
+          upscaleTiling:   UPSCALE_TILING.includes(saved.upscaleTiling)?saved.upscaleTiling:"Auto",
+          upscaleColor:    Object.prototype.hasOwnProperty.call(UPSCALE_COLOR,saved.upscaleColor)?saved.upscaleColor:"LAB",
           modeSettings:    (saved.modeSettings&&typeof saved.modeSettings==="object")?saved.modeSettings:{},
           autoSave:        saved.autoSave!==undefined?saved.autoSave:true,
           livePreview:     saved.livePreview===true,
@@ -816,14 +928,18 @@ app.registerExtension({
           steps:S.steps,quality:S.quality,optSol:S.optSol,optCache:S.optCache,optSage:S.optSage,samplerName:S.samplerName,schedulerName:S.schedulerName,randomizeSeed:S.randomizeSeed,seed:S.seed,batch:S.batch,
           loras:S.loras,chainClips:S.chainClips.map(c=>({prompt:c.prompt,duration:c.duration})),
           firstFrame:S.firstFrame,lastFrame:S.lastFrame,
-          refImages:S.refImages,refVideos:S.refVideos,refAudios:S.refAudios,
+          firstFrameSize:S.firstFrameSize,lastFrameSize:S.lastFrameSize,
+          i2vGuides:S.i2vGuides,
+          firstFrameOrientation:S.firstFrameOrientation,lastFrameOrientation:S.lastFrameOrientation,
+          resOrientation:S.resOrientation,
+          refImages:S.refImages,refImageSizes:S.refImageSizes,refVideos:S.refVideos,refAudios:S.refAudios,
           audioFile:S.audioFile,extendVideo:S.extendVideo,
-          kf:(S.kf||[]).map(k=>({img:k.img||null,pos:k.pos||0})),
+          kf:(S.kf||[]).map(k=>({img:k.img||null,pos:k.pos||0,width:k.width||null,height:k.height||null})),
           models:S.models,speedLora:S.speedLora,audioOn:S.audioOn,
           soundEnabled:S.soundEnabled,sound:S.sound,accent:S.accent,mcLength:S.mcLength,
-          upscaleFactor:S.upscaleFactor,upscaleMethod:S.upscaleMethod,
+          upscaleFactor:S.upscaleFactor,upscaleMethod:S.upscaleMethod,upscaleTemporal:S.upscaleTemporal,upscaleTiling:S.upscaleTiling,upscaleColor:S.upscaleColor,
           modeSettings:S.modeSettings,
-          autoSave:S.autoSave,customW:S.customW,customH:S.customH,
+          autoSave:S.autoSave,customW:S.customW,customH:S.customH,resFitAspect:S.resFitAspect,
           playOnFinish:S.playOnFinish,folded:S.folded,livePreview:S.livePreview,
           imgSub:S.imgSub,imgAspect:S.imgAspect,imgMP:S.imgMP,imgW:S.imgW,imgH:S.imgH,
           imgProfile:S.imgProfile,imgRefs:S.imgRefs,
@@ -1049,14 +1165,34 @@ app.registerExtension({
       upMethodWrap.appendChild(upMethodCapRow);
       const upMethodDD=DD(["SeedVR2 (AI restore)","RTX VSR (fast)"],S.upscaleMethod==="rtx"?"RTX VSR (fast)":"SeedVR2 (AI restore)",v=>{
         S.upscaleMethod=v==="RTX VSR (fast)"?"rtx":"seedvr";
-        persist();_updUpBtnTitle();
+        persist();_syncUpscaleInfo();_updUpBtnTitle();
       });
       upMethodWrap.appendChild(upMethodDD.el);
+      const upTemporalWrap=mk("div",{marginBottom:"12px"});
+      const upTemporalCap=mk("div",{display:"flex",alignItems:"center",gap:"4px",marginBottom:"5px"});
+      upTemporalCap.append(cap("SeedVR2 temporal stability"),infoIcon("Larger frame batches reduce shimmer between chunks but need more VRAM.\nFast: 5 / overlap 2\nBalanced: 13 / overlap 3\nStable: 21 / overlap 4\nMaximum: 33 / overlap 4"));
+      const upTemporalDD=DD(Object.keys(UPSCALE_TEMPORAL),S.upscaleTemporal,v=>{
+        S.upscaleTemporal=v;persist();_syncUpscaleInfo();_updUpBtnTitle();
+      });
+      upTemporalWrap.append(upTemporalCap,upTemporalDD.el);
+      const upTilingWrap=mk("div",{marginBottom:"12px"});
+      const upTilingCap=mk("div",{display:"flex",alignItems:"center",gap:"4px",marginBottom:"5px"});
+      upTilingCap.append(cap("SeedVR2 VAE tiling"),infoIcon("Auto uses output megapixels × temporal batch:\n<20: off\n20–31: decode 1024\n32–55: encode + decode 1024\n56–89: encode + decode 768\n90+: encode + decode 512\nManual sizes always tile both phases. Smaller tiles need less VRAM but run slower."));
+      const upTilingDD=DD(UPSCALE_TILING,S.upscaleTiling,v=>{
+        S.upscaleTiling=v;persist();_syncUpscaleInfo();_updUpBtnTitle();
+      });
+      upTilingWrap.append(upTilingCap,upTilingDD.el);
+      const upColorWrap=mk("div",{marginBottom:"12px"});
+      upColorWrap.appendChild(cap("SeedVR2 color correction"));
+      const upColorDD=DD(Object.keys(UPSCALE_COLOR),S.upscaleColor,v=>{
+        S.upscaleColor=v;persist();_syncUpscaleInfo();_updUpBtnTitle();
+      });
+      upColorWrap.appendChild(upColorDD.el);
       const upDitRow=_mkModelRow("upscaleDit","Upscale DiT model (SeedVR2)",["none"],()=>_updUpBtnTitle());
       upDitRow.firstChild.appendChild(infoIcon("Picking a model you don't have yet downloads it automatically on first use - the SeedVR2 pack handles the download. GGUF and safetensors variants both work."));
       const upVaeRow=_mkModelRow("upscaleVae","Upscale VAE (SeedVR2)",["none"],()=>_updUpBtnTitle());
       const upHint=mk("div",{fontSize:"9px",color:C.muted,marginTop:"4px",lineHeight:"1.4",marginBottom:"12px"});
-      tx(upHint,"Used by the 2x button under the video. Pick 'none' on the DiT to disable SeedVR2 - then switch the method to RTX VSR.");
+      tx(upHint,"The selected multiplier is applied to the actual source dimensions. The exact output size is shown under the video actions before launch.");
       const speedLoraWrap=mk("div",{marginBottom:"12px"});
       speedLoraWrap.appendChild(cap("Speed LoRA (Turbo preset)"));
       const speedLoraDD=DD(["none"],S.speedLora,v=>{S.speedLora=v==="none"?"":v;persist();});
@@ -1101,7 +1237,7 @@ app.registerExtension({
       tx(supBtn,"Buy me a coffee");
       supBtn.onclick=()=>window.open(SUPPORT_URL,"_blank");
       supWrap.append(supCap,supBtn);
-      settingsOverlay.append(settHdr,unetT2VRow,unetR2VRow,clipRow,vaeVRow,vaeARow,taeRow,upMethodWrap,upDitRow,upVaeRow,upHint,speedLoraWrap,audioToggle.el,soundToggle.el,playOnFinishToggle.el,sndWrap,accWrap,supWrap);
+      settingsOverlay.append(settHdr,unetT2VRow,unetR2VRow,clipRow,vaeVRow,vaeARow,taeRow,upMethodWrap,upTemporalWrap,upTilingWrap,upColorWrap,upDitRow,upVaeRow,upHint,speedLoraWrap,audioToggle.el,soundToggle.el,playOnFinishToggle.el,sndWrap,accWrap,supWrap);
 
       // -- HISTORY OVERLAY ---------------------------------------------------
       const historyOverlay=mk("div",{
@@ -1750,7 +1886,7 @@ app.registerExtension({
       modeHdr.append(modeTitleBlock,modeChev);
       const modeArea=mk("div",{display:"flex",flexDirection:"column",gap:"8px"});
 
-      const i2vArea=mk("div",{display:"flex",gap:"10px"});
+      const i2vArea=mk("div",{display:"flex",flexDirection:"column",gap:"10px"});
       const kfArea=mk("div",{display:"flex",flexDirection:"column",gap:"6px"});
       const refArea=mk("div",{display:"flex",flexDirection:"column",gap:"8px"});
       const chainArea=mk("div",{display:"flex",flexDirection:"column",gap:"6px"});
@@ -1897,11 +2033,100 @@ app.registerExtension({
       };
 
       // I2V slots
-      const firstSlot=ImgSlot(true,n=>{S.firstFrame=n;persist();});
-      const lastSlot=ImgSlot(true,n=>{S.lastFrame=n;persist();});
-      i2vArea.append(_mkSlotCard("First frame",firstSlot.el),_mkSlotCard("Last frame",lastSlot.el));
+      let _refreshResolution=()=>{};
+      const _rememberFrameInfo=(orientationKey,sizeKey,w,h)=>{
+        const orientation=(w&&h)?(h>w?"portrait":"landscape"):null;
+        const size=(w&&h)?{width:w,height:h}:null,prev=S[sizeKey];
+        if(S[orientationKey]===orientation&&((!size&&!prev)||(size&&prev&&size.width===prev.width&&size.height===prev.height))) return;
+        S[orientationKey]=orientation;S[sizeKey]=size;persist();_refreshResolution();
+      };
+      const firstSlot=ImgSlot(true,n=>{S.firstFrame=n;persist();},(w,h)=>_rememberFrameInfo("firstFrameOrientation","firstFrameSize",w,h));
+      const lastSlot=ImgSlot(true,n=>{S.lastFrame=n;persist();},(w,h)=>_rememberFrameInfo("lastFrameOrientation","lastFrameSize",w,h));
+      const i2vFramesRow=mk("div",{display:"flex",gap:"10px"});
+      i2vFramesRow.append(_mkSlotCard("First frame",firstSlot.el),_mkSlotCard("Last frame",lastSlot.el));
+      i2vArea.appendChild(i2vFramesRow);
       if(S.firstFrame) firstSlot._restorePreview(S.firstFrame);
       if(S.lastFrame) lastSlot._restorePreview(S.lastFrame);
+
+      const i2vGuidesBox=mk("div",{display:"flex",flexDirection:"column",gap:"7px",paddingTop:"7px",borderTop:`1px solid ${C.border}`});
+      const _guideTimingSyncs=[];
+      const _renderI2VGuides=()=>{
+        i2vGuidesBox.innerHTML="";
+        _guideTimingSyncs.length=0;
+        const hdr=mk("div",{display:"flex",alignItems:"center",gap:"7px"});
+        const title=mk("div",{fontSize:"9px",fontWeight:"700",color:C.muted,textTransform:"uppercase",letterSpacing:".07em"});
+        tx(title,`Temporal Guides (${S.i2vGuides.length})`);
+        const hint=infoIcon("Native MiniMaxH3AddGuide anchors, chained after First/Last Frame conditioning. Disabled guides are kept in the UI but omitted from the workflow.");
+        const add=mk("button",{marginLeft:"auto",background:"transparent",border:`1px dashed rgba(var(--h3accent-rgb),.4)`,borderRadius:"6px",padding:"4px 9px",fontSize:"8px",fontWeight:"700",color:"rgba(var(--h3accent-rgb),.8)",cursor:"pointer",outline:"none"},{type:"button"});
+        tx(add,"+ Add Guide");
+        add.disabled=S.i2vGuides.length>=32;
+        add.style.opacity=add.disabled?".35":"1";
+        add.onclick=()=>{
+          if(S.i2vGuides.length>=32) return;
+          const at=Math.round(Math.min(Math.max(0,S.duration-.01),(S.i2vGuides.length+1)*3.5)*100)/100;
+          S.i2vGuides.push({img:null,enabled:true,unit:"seconds",at,orientation:null,width:null,height:null});
+          persist();_renderI2VGuides();
+        };
+        hdr.append(title,hint,add);
+        i2vGuidesBox.appendChild(hdr);
+        if(!S.i2vGuides.length){
+          const empty=mk("div",{fontSize:"8px",color:C.dim,lineHeight:"1.4"});
+          tx(empty,"Optional: pin extra still frames at exact times without replacing First/Last Frame.");
+          i2vGuidesBox.appendChild(empty);
+          return;
+        }
+        S.i2vGuides.forEach((g,idx)=>{
+          const row=mk("div",{display:"flex",gap:"8px",alignItems:"center",padding:"7px",border:`1px solid ${C.border}`,borderRadius:"9px",background:C.bg1});
+          const slot=ImgSlot(false,n=>{g.img=n;persist();},(w,h)=>{
+            g.orientation=(w&&h)?(h>w?"portrait":"landscape"):null;
+            g.width=w||null;g.height=h||null;
+            persist();_refreshResolution();
+          });
+          if(g.img) slot._restorePreview(g.img);
+          const body=mk("div",{display:"flex",flexDirection:"column",gap:"5px",flex:"1",minWidth:"0"});
+          const top=mk("div",{display:"flex",alignItems:"center",gap:"6px"});
+          const name=mk("div",{fontSize:"9px",fontWeight:"700",color:C.text});tx(name,`Guide ${idx+1}`);
+          const enabled=mk("button",{borderRadius:"5px",padding:"2px 7px",fontSize:"8px",fontWeight:"700",cursor:"pointer",outline:"none"},{type:"button"});
+          const syncEnabled=()=>{
+            const on=g.enabled!==false;
+            tx(enabled,on?"ON":"OFF");
+            enabled.style.background=on?C.lime:C.bg2;
+            enabled.style.color=on?"#111":C.muted;
+            enabled.style.border=`1px solid ${on?C.lime:C.border}`;
+            enabled.setAttribute("aria-pressed",on?"true":"false");
+            row.style.opacity=on?"1":".55";
+          };
+          enabled.onclick=()=>{g.enabled=g.enabled===false;syncEnabled();persist();_refreshResolution();};
+          const remove=mk("button",{marginLeft:"auto",background:"transparent",border:"none",color:C.muted,fontSize:"12px",cursor:"pointer",padding:"0 3px"},{type:"button",title:"Remove guide","aria-label":`Remove Guide ${idx+1}`});
+          tx(remove,"x");
+          remove.onclick=()=>{S.i2vGuides.splice(idx,1);persist();_renderI2VGuides();_refreshResolution();};
+          top.append(name,enabled,remove);
+          const timing=mk("div",{display:"grid",gridTemplateColumns:"80px 72px 1fr",alignItems:"center",gap:"6px"});
+          const unitDD=DD(["Seconds","Frame"],g.unit==="frame"?"Frame":"Seconds",v=>{
+            const next=v==="Frame"?"frame":"seconds";
+            if(next===g.unit) return;
+            g.at=next==="frame"?Math.max(1,Math.round(Number(g.at||0)*24)+1):Math.max(0,Math.round(((Number(g.at||1)-1)/24)*100)/100);
+            g.unit=next;persist();_renderI2VGuides();
+          });
+          const value=NI("",g.at,g.unit==="frame"?1:0,g.unit==="frame"?9999:3600,g.unit==="frame"?1:.01,v=>{
+            g.at=g.unit==="frame"?Math.round(v):Math.round(v*100)/100;
+            persist();syncTiming();
+          },"72px");
+          const resolved=mk("div",{fontSize:"8px",color:C.muted,whiteSpace:"nowrap"});
+          const syncTiming=()=>{
+            const frame=guideFrameIndex(g,snapFrames(S.duration))+1;
+            tx(resolved,g.unit==="frame"?`= ${((frame-1)/24).toFixed(2)}s`:`→ frame ${frame}`);
+          };
+          _guideTimingSyncs.push(syncTiming);
+          syncTiming();syncEnabled();
+          timing.append(unitDD.el,value,resolved);
+          body.append(top,timing);
+          row.append(slot.el,body);
+          i2vGuidesBox.appendChild(row);
+        });
+      };
+      i2vArea.appendChild(i2vGuidesBox);
+      _renderI2VGuides();
 
       // R2V refs
       const _renderRefs=()=>{
@@ -1911,7 +2136,10 @@ app.registerExtension({
         refArea.appendChild(imgCap);
         const imgRow=mk("div",{display:"flex",gap:"8px",flexWrap:"wrap"});
         S.refImages.forEach((name,idx)=>{
-          const slot=ImgSlot(false,n=>{ if(n===null){S.refImages.splice(idx,1);} else { S.refImages[idx]=n; persist(); } _renderRefs(); });
+          const slot=ImgSlot(false,n=>{ if(n===null){S.refImages.splice(idx,1);delete S.refImageSizes[name];} else { S.refImages[idx]=n; } persist();_renderRefs(); },(w,h)=>{
+            if(w&&h) S.refImageSizes[name]={width:w,height:h}; else delete S.refImageSizes[name];
+            persist();_refreshResolution();
+          });
           imgRow.appendChild(slot.el);
           if(name) slot._restorePreview(name);
         });
@@ -2046,7 +2274,7 @@ app.registerExtension({
         kfArea.appendChild(hdr);
         S.kf.forEach((k,idx)=>{
           const row=mk("div",{display:"flex",alignItems:"center",gap:"8px"});
-          const slot=ImgSlot(false,n=>{k.img=n;persist();});
+          const slot=ImgSlot(false,n=>{k.img=n;persist();},(w,h)=>{k.width=w||null;k.height=h||null;persist();_refreshResolution();});
           row.appendChild(slot.el);
           if(k.img) slot._restorePreview(k.img);
           const posCap=mk("div",{fontSize:"9px",color:C.muted});tx(posCap,"Frame");
@@ -2062,7 +2290,7 @@ app.registerExtension({
         const addRow=mk("div",{display:"flex",gap:"6px"});
         const addKf=mk("button",{background:"transparent",border:`1px dashed rgba(var(--h3accent-rgb),.4)`,borderRadius:"6px",padding:"4px 12px",fontSize:"9px",fontWeight:"700",color:"rgba(var(--h3accent-rgb),.7)",cursor:"pointer",outline:"none"});
         tx(addKf,"+ Add keyframe (max 32)");
-        addKf.onclick=()=>{ if(S.kf.length<32){ S.kf.push({img:null,pos:Math.min(9999, (S.kf.length+1)*62)}); persist(); _renderKf(); } };
+        addKf.onclick=()=>{ if(S.kf.length<32){ S.kf.push({img:null,pos:Math.min(9999, (S.kf.length+1)*62),width:null,height:null}); persist(); _renderKf(); } };
         addRow.appendChild(addKf);
         kfArea.appendChild(addRow);
       };
@@ -2171,20 +2399,86 @@ app.registerExtension({
       paramsHdr.appendChild(paramsChev);
       const params=mk("div",{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px"});
       let _resItems=[];
+      const _effectiveResOrientation=()=>{
+        if(S.resOrientation!=="auto") return S.resOrientation;
+        if(S.mode==="i2v") return S.firstFrameOrientation||S.lastFrameOrientation||((S.i2vGuides||[]).find(g=>g.enabled!==false&&g.img&&g.orientation)||{}).orientation||"landscape";
+        return "landscape";
+      };
+      const _validSize=s=>s&&Number(s.width)>0&&Number(s.height)>0?s:null;
+      const _labeledSize=(s,label)=>{s=_validSize(s);return s?{width:Number(s.width),height:Number(s.height),label}:null;};
+      const _fitSourceSize=()=>{
+        if(S.mode==="i2v"){
+          if(S.firstFrame&&_validSize(S.firstFrameSize)) return _labeledSize(S.firstFrameSize,"First Frame");
+          if(S.lastFrame&&_validSize(S.lastFrameSize)) return _labeledSize(S.lastFrameSize,"Last Frame");
+          const index=(S.i2vGuides||[]).findIndex(g=>g.enabled!==false&&g.img&&g.width&&g.height);
+          return index>=0?_labeledSize(S.i2vGuides[index],`Guide ${index+1}`):null;
+        }
+        if(S.mode==="keyframes"){
+          const k=(S.kf||[]).filter(x=>x.img&&x.width&&x.height).sort((a,b)=>(a.pos||0)-(b.pos||0))[0];
+          return _labeledSize(k,k?`Keyframe ${k.pos}`:"Keyframe");
+        }
+        if(S.mode==="r2v"||S.mode==="audio_drive"){
+          const name=(S.refImages||[])[0];
+          return name?_labeledSize(S.refImageSizes[name],"Reference 1"):null;
+        }
+        return null;
+      };
+      const _orientRes=(r)=>{
+        if(!r||_effectiveResOrientation()!=="portrait"||r.width<=r.height) return r;
+        return Object.assign({},r,{
+          width:r.height,
+          height:r.width,
+          label:r.label.replace(/^\d+x\d+/,`${r.height}x${r.width}`),
+        });
+      };
+      const _shapeRes=(r)=>{
+        const source=S.resFitAspect?_fitSourceSize():null;
+        if(!r||!source) return _orientRes(r);
+        const fitted=fitResolutionToAspect(source.width,source.height,r.width,r.height);
+        const detail=r.label.replace(/^\d+x\d+\s*/,"").replace(/^\(|\)$/g,"");
+        return Object.assign({},r,fitted,{label:`${fitted.width}x${fitted.height} (Fit · ${detail})`});
+      };
       const _resolveRes=()=>{
         if(S.resolution==="Custom"){
           const w=Math.max(32,Math.min(16384,Math.round(S.customW/32)*32));
           const h=Math.max(32,Math.min(16384,Math.round(S.customH/32)*32));
           return {width:w,height:h,label:`${w}x${h} (custom)`};
         }
-        return _resItems.find(r=>r.label===S.resolution)||_resItems[0]||{width:960,height:544,label:S.resolution};
+        return _shapeRes(_resItems.find(r=>r.label===S.resolution)||_resItems[0]||{width:960,height:544,label:S.resolution});
       };
       const resRow=mk("div",{display:"flex",flexDirection:"column",gap:"3px"});
       const resCapRow=mk("div",{display:"flex",alignItems:"center",gap:"4px"});
       const resCap=mk("div",{fontSize:"10px",color:C.text});tx(resCap,"Resolution");
       resCapRow.append(resCap,infoIcon("The output pixel grid (width x height).\nHigher = sharper detail and more VRAM + time.\nPick Custom to set any size - snapped to multiples of 32.\nMiniMax H3 recommends up to 1344x768 (short edge <= 768, long edge <= 1344). Above that the model may repeat content or distort."));
-      const resDD=DD([],S.resolution,v=>{S.resolution=v;persist();_updateFramesLabel();_updResCustom();});
+      const resDD=DD([],S.resolution,v=>{
+        if(v==="Custom") S.resolution="Custom";
+        else {
+          const base=_resItems.find(r=>_shapeRes(r).label===v);
+          S.resolution=base?base.label:v;
+        }
+        persist();_updateFramesLabel();_syncResolutionUI();
+      });
       resRow.append(resCapRow,resDD.el);
+      const aspectRow=mk("div",{display:"grid",gridTemplateColumns:"auto 1fr",alignItems:"center",gap:"7px",marginTop:"2px"});
+      const aspectCap=mk("div",{fontSize:"9px",color:C.muted});tx(aspectCap,"Shape");
+      const aspectDD=DD(["Preset shape","Fit input"],S.resFitAspect?"Fit input":"Preset shape",v=>{
+        S.resFitAspect=v==="Fit input";persist();_syncResolutionUI();
+      });
+      aspectDD.el.title="Fit input keeps the primary image's aspect ratio, uses the selected preset as the pixel budget, and snaps width and height to multiples of 32.";
+      aspectRow.append(aspectCap,aspectDD.el);
+      resRow.appendChild(aspectRow);
+      const orientationRow=mk("div",{display:"grid",gridTemplateColumns:"auto 1fr",alignItems:"center",gap:"7px",marginTop:"2px"});
+      const orientationCap=mk("div",{fontSize:"9px",color:C.muted});tx(orientationCap,"Orientation");
+      const _orientationLabels={auto:"Auto",landscape:"Landscape",portrait:"Portrait"};
+      const orientationDD=DD(Object.values(_orientationLabels),_orientationLabels[S.resOrientation],v=>{
+        S.resOrientation=Object.keys(_orientationLabels).find(k=>_orientationLabels[k]===v)||"auto";
+        persist();_syncResolutionUI();
+      });
+      orientationDD.el.title="Auto follows the first uploaded I2V frame (or the last frame if no first frame is set). Landscape and Portrait force the orientation.";
+      orientationRow.append(orientationCap,orientationDD.el);
+      resRow.appendChild(orientationRow);
+      const fitInfo=mk("div",{display:"none",fontSize:"8px",color:C.muted,lineHeight:"1.4",padding:"2px 0"});
+      resRow.appendChild(fitInfo);
       const resCustom=mk("div",{display:"none",alignItems:"center",gap:"6px"});
       const resCW=NI("",S.customW,32,16384,32,v=>{S.customW=Math.max(32,Math.min(16384,Math.round(v/32)*32));persist();_updResMP();},"58px");
       const resCH=NI("",S.customH,32,16384,32,v=>{S.customH=Math.max(32,Math.min(16384,Math.round(v/32)*32));persist();_updResMP();},"58px");
@@ -2199,10 +2493,32 @@ app.registerExtension({
       resCustom.append(resCW,resX,resCH,resMPLbl);
       resRow.appendChild(resCustom);
       const _updResCustom=()=>{ resCustom.style.display=S.resolution==="Custom"?"flex":"none"; _updResMP(); };
+      const _syncResolutionUI=()=>{
+        if(!_resItems.length) return;
+        const labels=_resItems.map(r=>_shapeRes(r).label).concat("Custom");
+        const selected=S.resolution==="Custom"?"Custom":_shapeRes(_resItems.find(r=>r.label===S.resolution)||_resItems[0]||{width:960,height:544,label:S.resolution}).label;
+        resDD.set(selected);
+        resDD.updateItems(labels);
+        _updResCustom();
+        const fitting=S.resFitAspect&&S.resolution!=="Custom",source=fitting?_fitSourceSize():null;
+        orientationRow.style.display=fitting?"none":"grid";
+        fitInfo.style.display=fitting?"block":"none";
+        if(fitting){
+          if(source){
+            const r=_resolveRes(),mp=(r.width*r.height/1048576).toFixed(2);
+            tx(fitInfo,`${source.label} ${source.width}x${source.height} → canvas ${r.width}x${r.height} (${mp}MP)`);
+            fitInfo.style.color=(Math.min(r.width,r.height)>768||Math.max(r.width,r.height)>1344)?C.warn:C.muted;
+          }else{
+            tx(fitInfo,"Waiting for a primary image; using the preset shape for now.");
+            fitInfo.style.color=C.warn;
+          }
+        }
+      };
+      _refreshResolution=_syncResolutionUI;
       const durRow=mk("div",{display:"flex",flexDirection:"column",gap:"3px"});
       const durCap=mk("div",{fontSize:"10px",color:C.text});tx(durCap,"Duration (s)");
       const durInner=mk("div",{display:"flex",alignItems:"center",gap:"8px"});
-      const durNI=NI("",S.duration,1,30,0.5,v=>{S.duration=v;persist();_updateFramesLabel();},"60px");
+      const durNI=NI("",S.duration,1,30,0.5,v=>{S.duration=v;persist();_updateFramesLabel();_guideTimingSyncs.forEach(f=>f());},"60px");
       const framesLbl=mk("div",{fontSize:"9px",color:C.muted,flexShrink:"0"});
       durInner.append(durNI,framesLbl);
       durRow.append(durCap,durInner);
@@ -2317,8 +2633,8 @@ app.registerExtension({
           qualDD.set(_QL[ms.quality]||"Custom");
         }
         if(typeof _syncLiveToggle==="function") _syncLiveToggle();
-        if(ms.resolution!==undefined){ S.resolution=ms.resolution; resDD.set(ms.resolution); _updResCustom(); }
-        if(ms.duration!==undefined){ S.duration=ms.duration; durNI._inp.value=String(ms.duration); _updateFramesLabel(); }
+        if(ms.resolution!==undefined){ S.resolution=ms.resolution; if(_resItems.length) _syncResolutionUI(); else { resDD.set(ms.resolution); _updResCustom(); } }
+        if(ms.duration!==undefined){ S.duration=ms.duration; durNI._inp.value=String(ms.duration); _updateFramesLabel(); _guideTimingSyncs.forEach(f=>f()); }
         if(Array.isArray(ms.loras)){ const named=ms.loras.filter(l=>l&&l.name); S.loras=named.concat([{name:"",strength:1}]); _renderLoras(); }
         if(Array.isArray(ms.refImages)) S.refImages=ms.refImages.slice();
         if(Array.isArray(ms.refVideos)) S.refVideos=ms.refVideos.map(v=>(typeof v==="string")?{name:v,useAudio:false}:{name:(v&&v.name)||"",useAudio:!!(v&&v.useAudio)});
@@ -2335,6 +2651,7 @@ app.registerExtension({
         S.modeSettings[S.mode]=ms0;
         S.mode=m;
         _restoreModeState();
+        if(_resItems.length) _syncResolutionUI();
         persist();
         _updateTabs();
         _updateModeSections();
@@ -2557,7 +2874,11 @@ app.registerExtension({
       let _cmpImageRefIndex=0;
       let _upOrig=null;
       let _upResult=null;
-      let _upscaleRun="";
+      let _upTarget=null;
+      const _upscaleJobs=new Map();
+      const _generationJobs=new Map();
+      let _upscaleSubmitting=false;
+      let _generateSubmitting=false;
       const _isImageItem=item=>!!(item&&(item.kind==="image"||/\.(png|jpe?g|webp|bmp)$/i.test(item.filename||"")));
       const _inputImageUrl=name=>api.apiURL(`/view?filename=${encodeURIComponent(name)}&type=input&subfolder=`);
       const _outputImageUrl=item=>api.apiURL(`/view?filename=${encodeURIComponent(item.filename)}&type=${encodeURIComponent(item.type||"output")}&subfolder=${encodeURIComponent(item.subfolder||"")}`);
@@ -2694,16 +3015,16 @@ app.registerExtension({
       const ICON_UP='<path d="M12 19V5"/><path d="M5 12l7-7 7 7"/>';
       const ICON_DEL='<path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/>';
       const ICON_REFRESH='<path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/>';
-      const upBtn=actBtn("2x Upscale",()=>_runUpscale(),{icon:ICON_UP});
-      const upFactorWrap=mk("div",{width:"74px",flexShrink:"0"});
-      const upFactorDD=DD(["2x","3x","4x"],S.upscaleFactor+"x",v=>{
-        S.upscaleFactor=parseInt(v)||2;
+      const upBtn=actBtn(S.upscaleFactor+"x Upscale",()=>_runUpscale(),{icon:ICON_UP});
+      const upFactorWrap=mk("div",{width:"64px",flexShrink:"0"});
+      const upFactorDD=DD(["1.5x","1.75x","2x","2.25x","2.5x","2.75x","3x","3.5x","4x"],S.upscaleFactor+"x",v=>{
+        S.upscaleFactor=parseFloat(v)||1.5;
         tx(upBtn._lbl,S.upscaleFactor+"x Upscale");
-        persist();_updUpBtnTitle();
+        persist();_syncUpscaleInfo();_updUpBtnTitle();
       });
       upFactorWrap.appendChild(upFactorDD.el);
       const upTrig=upFactorDD.el.firstChild;
-      upTrig.style.width="74px";
+      upTrig.style.width="64px";
       upTrig.style.height="26px";
       upTrig.style.borderRadius="8px";
       upTrig.style.background="linear-gradient(180deg,#2b2b2b,#1e1e1e)";
@@ -2715,18 +3036,36 @@ app.registerExtension({
       upTrig.lastChild.style.marginLeft="3px";
       upTrig.onmouseenter=()=>{ upTrig.style.borderColor="var(--h3accent)"; };
       upTrig.onmouseleave=()=>{ if(upTrig.style.borderColor!=="var(--h3accent)") upTrig.style.borderColor="var(--h3-line2)"; };
-      const _updUpMethodLbl=()=>{ tx(upTrig.firstChild,S.upscaleMethod==="rtx"?"RTX":"SeedVR2"); };
+      const upInfo=mk("div",{display:"none",fontSize:"9px",color:C.muted,lineHeight:"1.45",padding:"0 2px",fontVariantNumeric:"tabular-nums"});
+      const _currentUpscaleTarget=()=>_curItem?upscaleTarget(_curItem.width,_curItem.height,S.upscaleFactor):null;
+      const _syncUpscaleInfo=()=>{
+        const target=_currentUpscaleTarget();
+        const video=!!(_curItem&&!_isImageItem(_curItem));
+        upInfo.style.display=video?"block":"none";
+        if(!video) return;
+        const temporal=UPSCALE_TEMPORAL[S.upscaleTemporal]||UPSCALE_TEMPORAL.Balanced;
+        const tiling=resolveUpscaleTiling(S.upscaleTiling,target,temporal);
+        const method=S.upscaleMethod==="rtx"?"RTX VSR":`SeedVR2 ${S.upscaleTemporal} · VAE ${tiling.label}`;
+        const pressure=target?target.width*target.height/1e6*temporal.batch:0;
+        upInfo.style.color=S.upscaleMethod!=="rtx"&&!tiling.decode&&pressure>=24?C.warn:C.muted;
+        tx(upInfo,target
+          ? `${_curItem.width}×${_curItem.height} → ${target.width}×${target.height} · ${S.upscaleFactor}x · ${method}`
+          : `${S.upscaleFactor}x · ${method} · loading source size…`);
+      };
       const _updUpBtnTitle=()=>{
-        _updUpMethodLbl();
         const rtx=S.upscaleMethod==="rtx";
+        const target=_currentUpscaleTarget();
+        const dims=target?`\n${_curItem.width}x${_curItem.height} → ${target.width}x${target.height}`:"";
         if(rtx){
-          upBtn.title="Upscale "+S.upscaleFactor+"x via RTX VSR\nNo model needed - uses your GPU's super resolution";
+          upBtn.title="Upscale "+S.upscaleFactor+"x via RTX VSR"+dims+"\nNo model needed - uses your GPU's super resolution";
           upBtn.classList.remove("warn");
           return;
         }
         const d=S.models.upscaleDit, v=S.models.upscaleVae;
+        const temporal=UPSCALE_TEMPORAL[S.upscaleTemporal]||UPSCALE_TEMPORAL.Balanced;
+        const tiling=resolveUpscaleTiling(S.upscaleTiling,target,temporal);
         if(d&&d!=="none"&&v&&v!=="none"){
-          upBtn.title="Upscale "+S.upscaleFactor+"x via SeedVR2\nDiT: "+d+"\nVAE: "+v;
+          upBtn.title="Upscale "+S.upscaleFactor+"x via SeedVR2"+dims+`\n${S.upscaleTemporal}: batch ${temporal.batch}, overlap ${temporal.overlap}\nVAE tiling: ${tiling.label}\nColor: ${S.upscaleColor}\nDiT: `+d+"\nVAE: "+v;
           upBtn.classList.remove("warn");
         }else{
           upBtn.title="Upscale via SeedVR2\nNo upscale model selected - open Settings";
@@ -2820,13 +3159,14 @@ app.registerExtension({
       galleryRefresh.innerHTML=`<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON_REFRESH}</svg>`+`<span style="margin-left:5px;">Refresh</span>`;
       galleryHdr.append(galleryTitle,saveTogBtn,galleryRefresh,galleryActs);
       const galleryWrap=mk("div",{display:"flex",flexDirection:"column",gap:"7px"});
-      galleryWrap.append(galleryHdr,galleryBox);
+      galleryWrap.append(galleryHdr,upInfo,galleryBox);
       rightPanel.append(previewBox,timeBar,galleryWrap);
 
       let _galItems=[];
       let _curItem=null;
       const _showVideo=(item,fromFinish)=>{
         _curItem=item;
+        _syncUpscaleInfo();_updUpBtnTitle();
         if(_cmpMode) _exitCompare();
         const imageCompare=S.mode==="image"&&["edit","refmix"].includes(S.imgSub)&&_cmpImageRefs.length>0&&_isImageItem(item);
         const upscaleCompare=!!(_upResult&&item.filename===_upResult.filename);
@@ -2844,6 +3184,13 @@ app.registerExtension({
           return;
         }
         vidEl.src=url;vidEl.style.display="block";imgEl.style.display="none";
+        const syncSize=()=>{
+          if(_curItem!==item||!vidEl.videoWidth||!vidEl.videoHeight) return;
+          item.width=vidEl.videoWidth;item.height=vidEl.videoHeight;
+          _syncUpscaleInfo();_updUpBtnTitle();
+        };
+        if(vidEl.readyState>=1) syncSize();
+        else vidEl.addEventListener("loadedmetadata",syncSize,{once:true});
         placeholder.style.display="none";errorBox.style.display="none";
         _updateSeedChip(item.filename);
         if(_seedByFile[item.filename]===undefined) _showSeedFromHistory(item.filename);
@@ -2875,27 +3222,51 @@ app.registerExtension({
         await fetch("/h3one/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({filename:_curItem.filename,subfolder:_curItem.subfolder||""})}).catch(()=>{});
         vidEl.src="";vidEl.style.display="none";imgEl.src="";imgEl.style.display="none";placeholder.style.display="flex";
         _curItem=null;
+        _syncUpscaleInfo();_updUpBtnTitle();
         _loadGallery();
       };
       const _runUpscale=async()=>{
-        if(!_curItem||S.generating) return;
+        if(!_curItem||_upscaleSubmitting||_generateSubmitting) return;
+        const target=_currentUpscaleTarget();
+        if(!target){
+          showError("Could not read the selected video's dimensions yet. Wait for the preview to load, then try Upscale again.");
+          return;
+        }
         const rtx=S.upscaleMethod==="rtx";
         if(!rtx && (!S.models.upscaleDit||S.models.upscaleDit==="none"||!S.models.upscaleVae||S.models.upscaleVae==="none")){
-          resetBtn();
           showError("Upscale needs a SeedVR2 model. Open Settings, then pick an Upscale DiT model + Upscale VAE - or switch the Upscale method to RTX VSR, which needs no model.");
           return;
         }
-        _upscaleRun=rtx?"upscale-rtx":"upscale-seedvr2";
-        _upOrig=_curItem?{filename:_curItem.filename,subfolder:_curItem.subfolder||""}:null;
-        S.generating=true;
-        _activeGenStartTs=Date.now();
+        const joining=S.generating;
+        const source={filename:_curItem.filename,subfolder:_curItem.subfolder||"",width:_curItem.width,height:_curItem.height};
+        const job={
+          run:rtx?"upscale-rtx":"upscale-seedvr2",
+          orig:{filename:source.filename,subfolder:source.subfolder},
+          target:{...target,factor:S.upscaleFactor},
+          started:Date.now(),
+        };
+        _upscaleSubmitting=true;
+        upBtn.disabled=true;
+        _activeNode=self;
+        _activeShowOutput=showOutput;
+        _activeResetBtn=resetBtn;
+        _activeShowError=showError;
+        _activeSetStage=setStage;
         _activeShowTime=showTime;
         _activeShowLatest=showLatest;
-        _activeShownFiles=[];
-        genBtn.disabled=true;tx(genBtnLbl,"Upscaling...");
-        progWrap.style.display="flex";setStage("Preparing upscale...",3);
+        if(!joining){
+          S.generating=true;
+          _activeGenStartTs=job.started;
+          _activeShownFiles=[];
+          _batchIds=[];_batchDone=0;_batchCompleted.clear();
+          genBtn.disabled=true;tx(genBtnLbl,"Upscaling...");
+          progWrap.style.display="flex";
+        }
+        const pendingId=`pending-upscale-${job.started}`;
+        _batchIds.push(pendingId);
+        setStage(joining?"Preparing another upscale...":"Preparing upscale...",3);
         try{
-          const stage=await fetch("/h3one/stage_input",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({filename:_curItem.filename,subfolder:_curItem.subfolder||""})});
+          const stage=await fetch("/h3one/stage_input",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({filename:source.filename,subfolder:source.subfolder})});
           const sd=await stage.json();
           if(!sd.ok) throw new Error(sd.error||"Could not prepare the video for upscale");
           const wf=await _fetchTpl(rtx?"upscale_rtx.json":"upscale.json");
@@ -2904,20 +3275,48 @@ app.registerExtension({
             wf["3"].inputs["resize_type.scale"]=S.upscaleFactor;
           }else{
             wf["3"].inputs.model=S.models.upscaleDit;
-            wf["4"].inputs.model=S.models.upscaleVae;
-            const resMap={2:1080,3:1440,4:2160};
-            wf["5"].inputs.resolution=resMap[S.upscaleFactor]||1080;
+            const temporal=UPSCALE_TEMPORAL[S.upscaleTemporal]||UPSCALE_TEMPORAL.Balanced;
+            const tiling=resolveUpscaleTiling(S.upscaleTiling,target,temporal);
+            const tileOverlap=Math.min(128,tiling.size/4);
+            Object.assign(wf["4"].inputs,{
+              model:S.models.upscaleVae,
+              offload_device:"cpu",
+              encode_tiled:tiling.encode,
+              encode_tile_size:tiling.size,
+              encode_tile_overlap:tileOverlap,
+              decode_tiled:tiling.decode,
+              decode_tile_size:tiling.size,
+              decode_tile_overlap:tileOverlap,
+              tile_debug:"false",
+            });
+            wf["5"].inputs.resolution=target.shortEdge;
+            wf["5"].inputs.batch_size=temporal.batch;
+            wf["5"].inputs.uniform_batch_size=true;
+            wf["5"].inputs.temporal_overlap=temporal.overlap;
+            wf["5"].inputs.color_correction=UPSCALE_COLOR[S.upscaleColor]||"lab";
+            wf["5"].inputs.offload_device="cpu";
+            wf["5"].inputs.enable_debug=true;
           }
           _applyAutoSave(wf);
           const body={prompt:wf,client_id:api.clientId,extra_data:{enable_previews:true}};
           const res=await api.fetchApi("/prompt",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
           const data=await res.json();
           if(data.error||!data.prompt_id) throw new Error(data.error?.message||"Unknown error");
-          _batchIds=[data.prompt_id];_batchDone=0;_activePromptId=data.prompt_id;
+          _upscaleJobs.set(data.prompt_id,job);
+          const pendingIndex=_batchIds.indexOf(pendingId);
+          if(pendingIndex>=0) _batchIds[pendingIndex]=data.prompt_id;
+          else _batchIds.push(data.prompt_id);
+          _activePromptId=data.prompt_id;
           _armFinishWatch();
-          setStage(rtx?("Upscaling "+S.upscaleFactor+"x with RTX VSR..."):("Upscaling "+S.upscaleFactor+"x with SeedVR2 ("+S.models.upscaleDit+")..."),8);
+          setStage(`Queued ${_batchIds.length}: ${source.width}x${source.height} → ${target.width}x${target.height} with ${rtx?"RTX VSR":"SeedVR2"}`,8);
         }catch(e){
-          resetBtn();showError(fmtErr(e));
+          _batchIds=_batchIds.filter(id=>id!==pendingId);
+          if(!joining) resetBtn();
+          else if(_batchCompleted.size>=_batchIds.length) _finishRun();
+          showError(fmtErr(e));
+        }finally{
+          _upscaleSubmitting=false;
+          upBtn.disabled=false;
         }
       };
       const _loadGallery=async()=>{
@@ -2974,8 +3373,11 @@ app.registerExtension({
       const resetBtn=()=>{
         S.generating=false;
         _batchIds=[];_batchDone=0;
+        _batchCompleted.clear();
+        _upscaleJobs.clear();
+        _generationJobs.clear();
+        _activePromptId=null;
         _stopFinishWatch();
-        _upscaleRun="";
         self._h3_lpOn=false;
         _showLiveChip(false);
         genBtn.disabled=false;
@@ -2995,31 +3397,43 @@ app.registerExtension({
         errorBox.append(title,body);
         vidEl.style.display="none";imgEl.style.display="none";placeholder.style.display="none";
       };
-      const showOutput=(item)=>{
+      const showOutput=(item,promptId)=>{
         errorBox.style.display="none";
-        if(S.seed!==undefined&&S.seed!==null&&S.seed!=="") _seedByFile[item.filename]=S.seed;
-        const genMs=Date.now()-_activeGenStartTs;
+        const upscaleJob=promptId?_upscaleJobs.get(promptId):null;
+        const generationJob=promptId?_generationJobs.get(promptId):null;
+        if(upscaleJob){
+          _upOrig=upscaleJob.orig;
+          _upTarget=upscaleJob.target;
+        }
+        if(generationJob){
+          _cmpImageRefs=generationJob.compareRefs;
+          _cmpImageRefIndex=0;
+          _syncCompareSourceSelect();
+        }
+        const outputSeed=generationJob?.seed??S.seed;
+        if(outputSeed!==undefined&&outputSeed!==null&&outputSeed!=="") _seedByFile[item.filename]=outputSeed;
+        const genMs=Date.now()-(upscaleJob?.started||generationJob?.started||_activeGenStartTs);
         _genTimeByFile[item.filename]=genMs;
-        const wasUpscale=_upscaleRun;
-        if(_upscaleRun&&_upOrig){
+        const wasUpscale=upscaleJob?.run||"";
+        if(wasUpscale&&_upOrig){
           _upResult={filename:item.filename,subfolder:item.subfolder||""};
         }
         _showVideo(item,true);
         if(_upResult&&_upResult.filename===item.filename){
           cmpBtn.style.display="block";
         }
-        _upscaleRun="";
+        if(promptId){ _upscaleJobs.delete(promptId);_generationJobs.delete(promptId); }
         _activeShownFiles.push(item.filename);
         const isTemp=item.type==="temp";
         if(!isTemp){
           fetch("/h3one/set_output",{method:"POST",headers:{"Content-Type":"application/json"},
             body:JSON.stringify({node_id:self.id,info:{filename:item.filename,subfolder:item.subfolder||""}})}).catch(()=>{});
-          const histMode=wasUpscale?("Upscale "+S.upscaleFactor+"x ("+(wasUpscale==="upscale-rtx"?"RTX VSR":"SeedVR2")+")"):S.mode;
-          const histRes=wasUpscale?(S.upscaleFactor+"x upscale"):(S.mode==="image"?(S.imgLastW+"x"+S.imgLastH):S.resolution);
+          const histMode=wasUpscale?("Upscale "+(_upTarget?.factor??S.upscaleFactor)+"x ("+(wasUpscale==="upscale-rtx"?"RTX VSR":"SeedVR2")+")"):(generationJob?.mode||S.mode);
+          const histRes=wasUpscale&&_upTarget?(`${_upTarget.width}x${_upTarget.height} (${_upTarget.factor}x)`):(wasUpscale?(S.upscaleFactor+"x upscale"):(generationJob?.resolution||(S.mode==="image"?(S.imgLastW+"x"+S.imgLastH):S.resolution)));
            fetch("/h3one/history",{method:"POST",headers:{"Content-Type":"application/json"},
              body:JSON.stringify({
-               mode:histMode,quality:wasUpscale?"":S.quality,prompt:(S.prompt||"").slice(0,2000),duration:wasUpscale?0:S.duration,
-               resolution:histRes,seed:S.seed,gen_time:genMs,video:item.filename,subfolder:item.subfolder||"",type:item.type||"output",
+               mode:histMode,quality:wasUpscale?"":(generationJob?.quality||S.quality),prompt:((generationJob?.prompt??S.prompt)||"").slice(0,2000),duration:wasUpscale?0:(generationJob?.duration??S.duration),
+               resolution:histRes,seed:outputSeed,gen_time:genMs,video:item.filename,subfolder:item.subfolder||"",type:item.type||"output",
                kind:item.kind==="image"?"image":"video",
              })}).catch(()=>{});
         }
@@ -3055,14 +3469,14 @@ app.registerExtension({
           return hit&&hit.gen_time? hit.gen_time : null;
         }catch(e){ return null; }
       };
-      const showLatest=async()=>{
+      const showLatest=async(promptId)=>{
         if(_activeShownFiles.length) return;
         try{
           const r=await fetch("/h3one/gallery");
           const d=await r.json();
           const items=d.videos||[];
           if(!items.length) return;
-          showOutput(items[0]);
+          showOutput(items[0],promptId);
         }catch(e){}
       };
 
@@ -3109,6 +3523,7 @@ app.registerExtension({
         const files=[];
         const add=(type,name)=>{ if(name) files.push({type,name}); };
         add("image",S.firstFrame); add("image",S.lastFrame);
+        (S.i2vGuides||[]).forEach(g=>add("image",g.img));
         (S.refImages||[]).forEach(n=>add("image",n));
         (S.refVideos||[]).forEach(v=>{ const n=(typeof v==="string")?v:v&&v.name; add("video",n); });
         (S.refAudios||[]).forEach(n=>add("audio",n));
@@ -3124,6 +3539,7 @@ app.registerExtension({
           steps:S.steps,
           width:res.width,
           height:res.height,
+          i2vGuides:(S.i2vGuides||[]).map(g=>({img:g.img||"",enabled:g.enabled!==false,unit:g.unit,at:Number(g.at)||0})),
           kf:(S.kf||[]).map(k=>({img:k.img||"",pos:Math.round(k.pos||0)})),
         };
         return JSON.stringify(fp);
@@ -3367,11 +3783,12 @@ app.registerExtension({
         if(mode==="chain") return _buildChain();
         if(mode==="image") return _buildImage();
         const wf=await _fetchTpl(TEMPLATES[mode]);
-        _patchCommon(wf);
+        const {frames}= _patchCommon(wf);
         let nextId=200;
         const newId=()=>String(nextId++);
         if(mode==="i2v"){
-          if(!S.firstFrame&&!S.lastFrame) throw new Error("I2V needs at least one image. Drop a First frame (animate from it), a Last frame (converge to it), or both (morph between them) - or switch to T2V mode.");
+          const guides=(S.i2vGuides||[]).map((guide,index)=>({guide,index})).filter(x=>x.guide.enabled!==false).sort((a,b)=>guideFrameIndex(a.guide,frames)-guideFrameIndex(b.guide,frames));
+          if(!S.firstFrame&&!S.lastFrame&&!guides.some(x=>x.guide.img)) throw new Error("I2V needs a First frame, Last frame, or at least one enabled Guide image - or switch to T2V mode.");
           if(S.firstFrame){
             const id=newId();
             wf[id]={class_type:"LoadImage",inputs:{image:S.firstFrame},_meta:{title:"First Frame"}};
@@ -3382,6 +3799,21 @@ app.registerExtension({
             wf[id2]={class_type:"LoadImage",inputs:{image:S.lastFrame},_meta:{title:"Last Frame"}};
             wf["6"].inputs.last_frame=[id2,0];
           }
+          let conditioning=["6",0];
+          guides.forEach(({guide:g,index})=>{
+            if(!g.img) throw new Error(`Guide ${index+1} is enabled but has no image. Add an image, disable it, or remove the guide.`);
+            const imageId=newId(), guideId=newId();
+            wf[imageId]={class_type:"LoadImage",inputs:{image:g.img},_meta:{title:`Guide ${index+1}`}};
+            wf[guideId]={class_type:"MiniMaxH3AddGuide",inputs:{
+              positive:conditioning,
+              vae:["3",0],
+              latent:["6",1],
+              image:[imageId,0],
+              frame_idx:guideFrameIndex(g,frames),
+            },_meta:{title:`AddGuide ${index+1}`}};
+            conditioning=[guideId,0];
+          });
+          wf["7"].inputs.conditioning=conditioning;
         } else if(mode==="r2v"){
           const hasRefs=S.refImages.length||S.refVideos.length||S.refAudios.length;
           if(!hasRefs) throw new Error("R2V needs at least one reference. Add a reference image, video or audio - or switch to T2V mode.");
@@ -3610,13 +4042,16 @@ app.registerExtension({
       };
 
       genBtn.onclick=async()=>{
-        if(S.generating) return;
-        _upOrig=null;_upResult=null;
-        if(_cmpMode) _exitCompare();
-        _cmpImageRefs=S.mode==="image"&&["edit","refmix"].includes(S.imgSub)?(S.imgRefs||[]).filter(Boolean).slice(0,S.imgSub==="edit"?1:9):[];
-        _cmpImageRefIndex=0;
-        _syncCompareSourceSelect();
-        cmpBtn.style.display="none";
+        if(_generateSubmitting||_upscaleSubmitting) return;
+        const joining=S.generating;
+        const started=Date.now();
+        const wantsLivePreview=!!S.livePreview&&S.mode!=="image";
+        if(wantsLivePreview&&_taeChecked&&!_taeFound){
+          showError(`Live Preview is on but the decoder "${S.models.tae}" was not found in a ComfyUI models/vae_approx folder.\nOpen Settings to pick the Live Preview decoder, download taeh3.safetensors from huggingface.co/Kijai/MiniMax-H3-TAE, or turn Live Preview off.`);
+          return;
+        }
+        _generateSubmitting=true;
+        genBtn.disabled=true;
         _activeNode=self;
         _activeShowOutput=showOutput;
         _activeResetBtn=resetBtn;
@@ -3624,55 +4059,75 @@ app.registerExtension({
         _activeSetStage=setStage;
         _activeShowTime=showTime;
         _activeShowLatest=showLatest;
-        _activeShownFiles=[];
-        _activeGenStartTs=Date.now();
-        showTime(0);
-        _activePromptId=null;
-        S.generating=true;
-        genBtn.disabled=true;tx(genBtnLbl,"Generating...");
-        genBtn.style.background="linear-gradient(270deg,var(--h3accent),#e8d5c0,#a259ff,var(--h3accent))";
-        genBtn.style.backgroundSize="300% 300%";
-        genBtn.style.animation="h3-gradient 2.4s ease infinite";
-        genBtn.style.color=C.lime;
-        stopBtn.style.maxWidth="120px";stopBtn.style.minWidth="";stopBtn.style.width="";stopBtn.style.opacity="1";stopBtn.style.padding="0 14px";stopBtn.style.marginLeft="6px";
-        progWrap.style.display="flex";setStage("Building workflow...",3);
-        errorBox.style.display="none";
-        _showLiveChip(false);
-        self._h3_lpOn=!!S.livePreview&&S.mode!=="image";
-        self._h3_lpId=S.mode==="chain"?"s:lp":"lp";
-        if(self._h3_lpOn&&_taeChecked&&!_taeFound){
-          resetBtn();
-          showError(`Live Preview is on but the decoder "${S.models.tae}" was not found in a ComfyUI models/vae_approx folder.\nOpen Settings to pick the Live Preview decoder, download taeh3.safetensors from huggingface.co/Kijai/MiniMax-H3-TAE, or turn Live Preview off.`);
-          return;
+        if(!joining){
+          _upOrig=null;_upResult=null;
+          if(_cmpMode) _exitCompare();
+          cmpBtn.style.display="none";
+          _activeShownFiles=[];
+          _activeGenStartTs=started;
+          showTime(0);
+          _activePromptId=null;
+          _batchIds=[];_batchDone=0;_batchCompleted.clear();
+          S.generating=true;
+          genBtn.style.background="linear-gradient(270deg,var(--h3accent),#e8d5c0,#a259ff,var(--h3accent))";
+          genBtn.style.backgroundSize="300% 300%";
+          genBtn.style.animation="h3-gradient 2.4s ease infinite";
+          genBtn.style.color=C.lime;
+          stopBtn.style.maxWidth="120px";stopBtn.style.minWidth="";stopBtn.style.width="";stopBtn.style.opacity="1";stopBtn.style.padding="0 14px";stopBtn.style.marginLeft="6px";
+          progWrap.style.display="flex";
+          self._h3_lpOn=wantsLivePreview;
+          self._h3_lpId=S.mode==="chain"?"s:lp":"lp";
         }
+        tx(genBtnLbl,joining?"Queueing...":"Generating...");
+        setStage(joining?"Building another workflow...":"Building workflow...",3);
+        errorBox.style.display="none";
+        if(!joining) _showLiveChip(false);
+        const n=Math.max(1,Math.min(4,S.batch||1));
+        const pendingIds=Array.from({length:n},(_,i)=>`pending-generate-${started}-${i}`);
+        _batchIds.push(...pendingIds);
         try{
-          const n=Math.max(1,Math.min(4,S.batch||1));
-          const ids=[];
           for(let i=0;i<n;i++){
             if(S.randomizeSeed){ S.seed=Math.floor(Math.random()*9007199254740991); seedNI._inp.value=String(S.seed); }
             const wf=await _buildWorkflow();
+            const job={
+              started,
+              seed:S.seed,
+              mode:S.mode,
+              quality:S.quality,
+              prompt:S.prompt||"",
+              duration:S.duration,
+              resolution:S.mode==="image"?`${S.imgLastW}x${S.imgLastH}`:S.resolution,
+              compareRefs:S.mode==="image"&&["edit","refmix"].includes(S.imgSub)?(S.imgRefs||[]).filter(Boolean).slice(0,S.imgSub==="edit"?1:9):[],
+            };
             const body={prompt:wf,client_id:api.clientId,extra_data:{enable_previews:true}};
             const res=await api.fetchApi("/prompt",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
             const data=await res.json();
             if(data.error||!data.prompt_id){
               throw new Error(data.error?.message||JSON.stringify(data.error)||"Unknown error");
             }
-            ids.push(data.prompt_id);
+            _generationJobs.set(data.prompt_id,job);
+            const pendingIndex=_batchIds.indexOf(pendingIds[i]);
+            if(pendingIndex>=0) _batchIds[pendingIndex]=data.prompt_id;
+            _activePromptId=data.prompt_id;
+            _armFinishWatch();
           }
-          _batchIds=ids;
-          _batchDone=0;
-          _activePromptId=ids[ids.length-1];
-          _armFinishWatch();
-          setStage(n>1?`Queued ${n} runs...`:"In queue...",6);
+          setStage(`Queued ${_batchIds.length} run${_batchIds.length===1?"":"s"}`,6);
         }catch(e){
-          resetBtn();showError(fmtErr(e));
+          _batchIds=_batchIds.filter(id=>!pendingIds.includes(id));
+          if(!_batchIds.length) resetBtn();
+          else if(_batchCompleted.size>=_batchIds.length) _finishRun();
+          showError(fmtErr(e));
+        }finally{
+          _generateSubmitting=false;
+          genBtn.disabled=false;
+          if(S.generating) tx(genBtnLbl,"Queue another");
         }
       };
 
       stopBtn.onclick=async()=>{
         try{await api.fetchApi("/interrupt",{method:"POST"});}catch(e){}
-        if(_activePromptId){
-          try{await api.fetchApi("/queue",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({delete:[_activePromptId]})});}catch(e){}
+        if(_batchIds.length){
+          try{await api.fetchApi("/queue",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({delete:_batchIds})});}catch(e){}
           _activePromptId=null;
         }
         resetBtn();
@@ -3729,10 +4184,10 @@ app.registerExtension({
           const d=await r.json();
           if(Array.isArray(d.resolution_presets)){
             _resItems=d.resolution_presets;
-            resDD.updateItems(_resItems.map(r=>r.label).concat("Custom"));
             if(S.resolution!=="Custom"&&!_resItems.some(r=>r.label===S.resolution)&&_resItems.length){
-              S.resolution=_resItems[0].label;resDD.set(S.resolution);persist();
+              S.resolution=_resItems[0].label;persist();
             }
+            _syncResolutionUI();
           }
           _updResCustom();
           _discTmpl=d.prompt_templates||{};
@@ -3848,7 +4303,7 @@ app.registerExtension({
           let empty=S.kf.find(k=>!k.img);
           if(!empty){
             if(S.kf.length>=32) return;
-            empty={img:null,pos:Math.min(9999,(S.kf.length+1)*62)};
+            empty={img:null,pos:Math.min(9999,(S.kf.length+1)*62),width:null,height:null};
             S.kf.push(empty);
           }
           const fd=new FormData();fd.append("image",file);fd.append("overwrite","true");
@@ -3919,20 +4374,22 @@ app.registerExtension({
     if(!out) return;
     const vids=out.videos||out.gifs||null;
     if(vids&&Array.isArray(vids)&&vids.length&&_activeShowOutput){
-      _activeShowOutput(vids[vids.length-1]);
+      _activeShowOutput(vids[vids.length-1],d.prompt_id);
       _activeSetStage?.("Done",97);
     }
     const imgs=out.images||null;
     if(imgs&&Array.isArray(imgs)&&imgs.length&&_activeShowOutput){
       const im=imgs[imgs.length-1];
       const animated=!!(out.animated&&out.animated.length);
-      _activeShowOutput({filename:im.filename,subfolder:im.subfolder||"",type:im.type||"output",kind:animated?"video":"image"});
+      _activeShowOutput({filename:im.filename,subfolder:im.subfolder||"",type:im.type||"output",kind:animated?"video":"image"},d.prompt_id);
       _activeSetStage?.("Done",97);
     }
   });
 
-  api.addEventListener("execution_success",()=>{
-    _finishRun();
+  api.addEventListener("execution_success",(evt)=>{
+    const promptId=evt.detail?.prompt_id;
+    if(promptId&&_batchIds.length&&!_batchIds.includes(promptId)) return;
+    _finishRun(promptId);
   });
 
   api.addEventListener("execution_error",(evt)=>{
@@ -3941,6 +4398,7 @@ app.registerExtension({
     if(d?.prompt_id&&_batchIds.length&&!_batchIds.includes(d.prompt_id)) return;
     const msg=fmtErr(d?.exception_message||d?.error||d||"Execution failed.");
     _activeShowError?.(msg);
-    _activeResetBtn?.();
+    if(d?.prompt_id) _finishRun(d.prompt_id);
+    else _activeResetBtn?.();
   });
 })();
