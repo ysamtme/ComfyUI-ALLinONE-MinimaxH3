@@ -1,5 +1,6 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
+import { cloneJSON,fitResolutionToAspect,mediaKey,resolveNodeState,selectDefaults,selectSolProvider } from "./h3_helpers.mjs";
 
 const ACCENT_DEFAULT = "#c0a996";
 const SUPPORT_URL = "https://ko-fi.com/leonq8";
@@ -23,7 +24,7 @@ const mediaCol = (t, a=1) => `rgba(${(MEDIA[t]||{rgb:"200,200,200"}).rgb},${a})`
 // Global video hover-preview mute (persisted; applies to every video slot in every mode)
 let _videoMuted=false;
 try{ _videoMuted=localStorage.getItem("one_node_minimax_h3_video_muted")==="1"; }catch(e){}
-const _videoMuteListeners=[];
+const _videoMuteListeners=new Set();
 const SPEAKER_SVG='<path d="M11 5 L6 9 L2 9 L2 15 L6 15 L11 19 Z" fill="currentColor" stroke="none"/><path d="M15.5 8.5 a5 5 0 0 1 0 7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M18 6 a9 9 0 0 1 0 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>';
 const SPEAKER_MUTED_SVG=SPEAKER_SVG+'<line x1="2.5" y1="2.5" x2="21.5" y2="21.5" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"/>';
 function setVideoMuted(m){
@@ -35,7 +36,8 @@ function setVideoMuted(m){
 const NODE_W = 1200;
 const NODE_H = 700;
 const H3_SEED_MAX = 1125899906842623;
-const LS_KEY = "one_node_minimax_h3_state";
+const LEGACY_LS_KEY = "one_node_minimax_h3_state";
+const DEFAULTS_LS_KEY = "h3one.defaults.v2";
 
 const MODES = [
   { key:"t2v",         label:"T2V" },
@@ -108,21 +110,22 @@ function guideFrameIndex(guide,totalFrames){
 }
 console.assert(guideFrameIndex({unit:"seconds",at:3.88},362)===93&&guideFrameIndex({unit:"frame",at:94},362)===93,"[H3One] guide timing self-check failed");
 
-function fitResolutionToAspect(sourceWidth,sourceHeight,targetWidth,targetHeight){
-  const ratio=Number(sourceWidth)/Number(sourceHeight),targetPixels=Number(targetWidth)*Number(targetHeight);
-  if(!(ratio>0)||!(targetPixels>0)) return {width:targetWidth,height:targetHeight};
-  let best=null;
-  for(let width=32;width<=1344;width+=32){
-    for(let height=32;height<=1344;height+=32){
-      const aspectError=Math.abs(Math.log((width/height)/ratio));
-      const areaError=Math.abs(Math.log((width*height)/targetPixels));
-      const score=aspectError*8+areaError;
-      if(!best||score<best.score) best={width,height,score};
-    }
-  }
-  return {width:best.width,height:best.height};
+{const portrait=fitResolutionToAspect(1501,2000,1344,768),square=fitResolutionToAspect(2000,2000,1344,768);console.assert(portrait.width===768&&portrait.height===1024&&square.width===768&&square.height===768,"[H3One] fit-resolution self-check failed");}
+
+async function requestJSON(url,options={},viaApi=false){
+  const response=await (viaApi?api.fetchApi(url,options):fetch(url,options));
+  let data=null;
+  try{ data=await response.json(); }catch(e){ if(response.ok) return {}; }
+  if(!response.ok||data?.ok===false) throw new Error(data?.error?.message||data?.error||`Request failed (HTTP ${response.status})`);
+  return data||{};
 }
-{const r=fitResolutionToAspect(1501,2000,1344,768);console.assert(r.width===864&&r.height===1152,"[H3One] fit-resolution self-check failed");}
+
+const jsonOptions=(method,data)=>({method,headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});
+
+function disposeChildren(el){
+  if(!el) return;
+  [...el.querySelectorAll("*")].forEach(child=>{ try{ child._h3Dispose?.(); }catch(e){} });
+}
 
 function upscaleTarget(sourceWidth,sourceHeight,factor){
   const width=Number(sourceWidth),height=Number(sourceHeight),scaleFactor=Number(factor);
@@ -307,8 +310,9 @@ function Toggle(labelTxt,checked,onChange,infoTxt){
   return{el:wrap,get value(){return val;},_setChecked};
 }
 
-function DD(items,selected,onChange){
+function DD(items,selected,onChange,onBlocked){
   let val=selected;
+  const _item=i=>typeof i==="string"?{label:i,value:i,disabled:false,reason:""}:{label:i.label??i.value,value:i.value??i.label,disabled:!!i.disabled,reason:i.reason||""};
   const wrap=mk("div",{position:"relative",width:"100%",minWidth:"0",overflow:"hidden"});
   const trig=mk("div",{background:C.bg3,border:`1px solid ${C.border}`,borderRadius:"7px",
     padding:"0 8px",height:"28px",display:"flex",alignItems:"center",
@@ -331,15 +335,15 @@ function DD(items,selected,onChange){
   const _norm=(s)=>(s||"").replace(/\\/g,"/").toLowerCase();
   const render=q=>{
     list.innerHTML="";
-    items.filter(i=>!q||i.toLowerCase().includes(q.toLowerCase())).forEach(item=>{
-      const isSel=_norm(item)===_norm(val);
-      const r=mk("div",{padding:"7px 12px",fontSize:"11px",cursor:"pointer",
-        color:isSel?C.lime:C.text,background:isSel?C.bg2:"transparent",
+    items.map(_item).filter(i=>!q||i.label.toLowerCase().includes(q.toLowerCase())).forEach(item=>{
+      const isSel=_norm(item.value)===_norm(val)||_norm(item.label)===_norm(val);
+      const r=mk("div",{padding:"7px 12px",fontSize:"11px",cursor:item.disabled?"not-allowed":"pointer",
+        color:item.disabled?C.dim:(isSel?C.lime:C.text),background:isSel?C.bg2:"transparent",opacity:item.disabled?".55":"1",
         whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis",transition:"background .1s"});
-      tx(r,item);
-      r.onmouseenter=()=>r.style.background=C.bg3;
-      r.onmouseleave=()=>r.style.background=_norm(item)===_norm(val)?C.bg2:"transparent";
-      r.onclick=()=>{val=item;tx(trigTxt,item);trigTxt.style.color=item?C.lime:C.muted;close();onChange(item);};
+      tx(r,item.label);r.title=item.reason;
+      r.onmouseenter=()=>{if(!item.disabled)r.style.background=C.bg3;};
+      r.onmouseleave=()=>r.style.background=isSel?C.bg2:"transparent";
+      r.onclick=()=>{if(item.disabled){close();onBlocked?.(item.reason||`${item.label} is unavailable`);return;}val=item.value;tx(trigTxt,item.label);trigTxt.style.color=item.value?C.lime:C.muted;close();onChange(item.value);};
       list.appendChild(r);
     });
   };
@@ -355,25 +359,28 @@ function DD(items,selected,onChange){
     reposition();arr.style.transform="rotate(180deg)";
     trig.style.borderColor=C.lime;showDimmer();
     srch.value="";srch.focus();render("");
+    queueMicrotask(()=>document.addEventListener("click",outsideClick));
   };
   const close=()=>{
+    document.removeEventListener("click",outsideClick);
     panel.style.display="none";
     if(panel.parentNode)panel.parentNode.removeChild(panel);
     arr.style.transform="";trig.style.borderColor=C.border;hideDimmer();
   };
+  const outsideClick=e=>{if(!wrap.contains(e.target)&&!panel.contains(e.target))close();};
   srch.oninput=()=>render(srch.value);
   trig.onclick=e=>{e.stopPropagation();panel.style.display==="flex"?close():open();};
-  document.addEventListener("click",e=>{if(!wrap.contains(e.target)&&!panel.contains(e.target))close();});
   trig.onmouseenter=()=>{if(panel.style.display!=="flex")trig.style.background=C.bg2;};
   trig.onmouseleave=()=>{if(panel.style.display!=="flex")trig.style.background=C.bg3;};
   panel.appendChild(srch);
   panel.appendChild(list);
   wrap.appendChild(trig);
+  wrap._h3Dispose=close;
   render("");
   return{
     el:wrap,get value(){return val;},
-    set(v){val=v;tx(trigTxt,v);trigTxt.style.color=v?C.lime:C.muted;render("");},
-    updateItems(ni){items=ni;if(!ni.some(i=>_norm(i)===_norm(val))){val=ni[0]||val;tx(trigTxt,val);trigTxt.style.color=val?C.lime:C.muted;onChange(val);}render(srch.value||"");},
+    set(v){val=v;const found=items.map(_item).find(i=>_norm(i.value)===_norm(v)||_norm(i.label)===_norm(v));tx(trigTxt,found?.label??v);trigTxt.style.color=v?C.lime:C.muted;render("");},
+    updateItems(ni){items=ni;const normalized=ni.map(_item);if(!normalized.some(i=>_norm(i.value)===_norm(val)||_norm(i.label)===_norm(val))){const first=normalized.find(i=>!i.disabled);if(first){val=first.value;tx(trigTxt,first.label);trigTxt.style.color=val?C.lime:C.muted;onChange(val);}}render(srch.value||"");},
   };
 }
 
@@ -417,7 +424,6 @@ function mkRmBtn(){
 }
 
 const _pendingUploads=new Set();
-let _h3ShowError=null;
 const _trackUpload=promise=>{
   const task=Promise.resolve(promise);
   _pendingUploads.add(task);
@@ -428,12 +434,15 @@ const _waitForUploads=async()=>{
   while(_pendingUploads.size) await Promise.allSettled([..._pendingUploads]);
 };
 const _uploadImage=file=>_trackUpload((async()=>{
-  const fd=new FormData();fd.append("image",file);fd.append("overwrite","true");
-  const response=await api.fetchApi("/upload/image",{method:"POST",body:fd});
-  if(!response.ok) throw new Error(`upload failed (HTTP ${response.status})`);
-  const data=await response.json();
+  const fd=new FormData();fd.append("image",file);
+  const data=await requestJSON("/upload/image",{method:"POST",body:fd},true);
   if(!data||!data.name) throw new Error("upload returned no filename");
   return data.name;
+})());
+
+const _uploadMedia=file=>_trackUpload((async()=>{
+  const fd=new FormData();fd.append("file",file,file.name);
+  return await requestJSON("/h3one/upload",{method:"POST",body:fd});
 })());
 
 function ImgSlot(optional,onFile,onDimensions){
@@ -490,6 +499,7 @@ function ImgSlot(optional,onFile,onDimensions){
     const f=e.dataTransfer.files[0];if(f&&f.type.startsWith("image/"))_load(f);
   });
   let _currentName=null;
+  let _objUrl=null;
   const _showLoaded=(src,fname)=>{
     dimensions.style.display="none";
     prevEl.onload=()=>{
@@ -504,6 +514,8 @@ function ImgSlot(optional,onFile,onDimensions){
   };
   const _load=async(file)=>{
     const objUrl=URL.createObjectURL(file);
+    if(_objUrl) URL.revokeObjectURL(_objUrl);
+    _objUrl=objUrl;
     _showLoaded(objUrl,file.name);
     const previous=_currentName;
     try{
@@ -512,6 +524,7 @@ function ImgSlot(optional,onFile,onDimensions){
     }catch(err){
       console.warn("[H3One] upload:",err);
       _currentName=previous;
+      if(_objUrl===objUrl){URL.revokeObjectURL(_objUrl);_objUrl=null;}
       if(previous){
         _restorePreview(previous);
       }else{
@@ -519,7 +532,7 @@ function ImgSlot(optional,onFile,onDimensions){
         rm.style.display="none";icoWrap.style.display="flex";wrap.style.borderColor=C.border;
         if(onDimensions) onDimensions(null,null);
       }
-      _h3ShowError?.("Image upload failed: "+(err?.message||String(err))+"\nThe previous image was kept.");
+      wrap.dispatchEvent(new CustomEvent("h3-error",{bubbles:true,detail:"Image upload failed: "+(err?.message||String(err))+"\nThe previous image was kept."}));
     }finally{inp.value="";}
   };
   inp.onchange=()=>{if(inp.files[0])_load(inp.files[0]);};
@@ -528,19 +541,22 @@ function ImgSlot(optional,onFile,onDimensions){
     prevEl.src="";prevEl.style.display="none";
     dimensions.style.display="none";rm.style.display="none";icoWrap.style.display="flex";
     wrap.style.borderColor=C.border;inp.value="";_currentName=null;
+    if(_objUrl){URL.revokeObjectURL(_objUrl);_objUrl=null;}
     if(onDimensions) onDimensions(null,null);
     onFile(null);
   };
   const _restorePreview=(name)=>{
     if(!name) return;
+    if(_objUrl){URL.revokeObjectURL(_objUrl);_objUrl=null;}
     const src=api.apiURL(`/view?filename=${encodeURIComponent(name)}&type=input&subfolder=&t=${Date.now()}`);
     _currentName=name;
     _showLoaded(src,name);
   };
-  return{el:wrap,get name(){return _currentName;},loadFile:(file)=>_load(file),_restorePreview};
+  wrap._h3Dispose=()=>{if(_objUrl){URL.revokeObjectURL(_objUrl);_objUrl=null;}prevEl.src="";};
+  return{el:wrap,get name(){return _currentName;},loadFile:(file)=>_load(file),_restorePreview,destroy:wrap._h3Dispose};
 }
 
-function MediaSlot(type,onFile){
+function MediaSlot(type,onFile,onDimensions){
   const acceptMap={video:"video/*",audio:"audio/*"};
   const icons={
     video:`<rect x="2" y="2" width="20" height="20" rx="2.5"/><polygon points="10 8 16 12 10 16 10 8" fill="currentColor" stroke="none"/>`,
@@ -619,7 +635,8 @@ function MediaSlot(type,onFile){
       spkSvg.innerHTML=m?SPEAKER_MUTED_SVG:SPEAKER_SVG;
       spkBtn.style.color=m?"#ff8080":C.lime;
     };
-    _videoMuteListeners.push(_applyMute);
+    _videoMuteListeners.add(_applyMute);
+    spkBtn._muteListener=_applyMute;
     _applyMute(_videoMuted);
     spkBtn.onmouseenter=()=>{spkBtn.style.borderColor=C.lime;};
     spkBtn.onmouseleave=()=>{spkBtn.style.borderColor=C.border;};
@@ -659,6 +676,7 @@ function MediaSlot(type,onFile){
         if(videoThumb.videoWidth&&videoThumb.videoHeight){
           tx(loadedName,`${videoThumb.videoWidth}×${videoThumb.videoHeight}`);
           loadedName.title=`${name} — ${videoThumb.videoWidth}×${videoThumb.videoHeight}`;
+          onDimensions?.(videoThumb.videoWidth,videoThumb.videoHeight);
         }
       },{once:true});
     }
@@ -697,6 +715,7 @@ function MediaSlot(type,onFile){
     if(spkBtn) spkBtn.style.display="none";
     _stopAudio();
     if(_objUrl){URL.revokeObjectURL(_objUrl);_objUrl=null;}
+    onDimensions?.(null,null);
     onFile(null);
   };
   const _restorePreview=(name)=>{
@@ -713,6 +732,7 @@ function MediaSlot(type,onFile){
         if(videoThumb.videoWidth&&videoThumb.videoHeight){
           tx(loadedName,`${videoThumb.videoWidth}×${videoThumb.videoHeight}`);
           loadedName.title=`${name} — ${videoThumb.videoWidth}×${videoThumb.videoHeight}`;
+          onDimensions?.(videoThumb.videoWidth,videoThumb.videoHeight);
         }
       },{once:true});
     }
@@ -723,107 +743,93 @@ function MediaSlot(type,onFile){
   const _load=async(file)=>{
     const nextUrl=URL.createObjectURL(file);
     try{
-      const data=await _trackUpload((async()=>{
-        const fd=new FormData();fd.append("file",file,file.name);
-        const res=await fetch("/h3one/upload",{method:"POST",body:fd});
-        const body=await res.json();
-        if(!res.ok||!body.ok) throw new Error(body.error||`upload failed (HTTP ${res.status})`);
-        return body;
-      })());
+      const data=await _uploadMedia(file);
       if(_objUrl) URL.revokeObjectURL(_objUrl);
       _objUrl=nextUrl;
       _showLoaded(data.filename,_objUrl);onFile(data.filename);
     }catch(e){
       URL.revokeObjectURL(nextUrl);
       console.error("[H3One] upload error:",e);
-      _h3ShowError?.("Media upload failed: "+(e?.message||String(e))+"\nThe previous file was kept.");
+      wrap.dispatchEvent(new CustomEvent("h3-error",{bubbles:true,detail:"Media upload failed: "+(e?.message||String(e))+"\nThe previous file was kept."}));
     }
   };
   fileInp.onchange=()=>{ const f=fileInp.files[0];if(f)_load(f);fileInp.value=""; };
   rm.onclick=e=>{ e.stopPropagation();_clearLoaded(); };
   wrap.clear=_clearLoaded;
   wrap._restorePreview=_restorePreview;
+  wrap._h3Dispose=()=>{
+    _stopAudio();
+    if(videoThumb){try{videoThumb.pause();}catch(e){}videoThumb.src="";}
+    if(_objUrl){URL.revokeObjectURL(_objUrl);_objUrl=null;}
+    if(spkBtn?._muteListener)_videoMuteListeners.delete(spkBtn._muteListener);
+  };
   return wrap;
 }
 
-function loadState(){ try{return JSON.parse(localStorage.getItem(LS_KEY)||"{}");}catch(e){return{};} }
-function saveState(s){ try{localStorage.setItem(LS_KEY,JSON.stringify(s));}catch(e){} }
+const DEFAULT_STATE_FIELDS=["mode","resolution","duration","steps","quality","optSol","optCache","optSage","samplerName","schedulerName","randomizeSeed","batch","models","speedLora","audioOn","soundEnabled","sound","accent","mcLength","customW","customH","resFitAspect","mediaFit","upscaleFactor","upscaleMethod","upscaleTemporal","upscaleTiling","upscaleColor","autoSave","livePreview","playOnFinish","folded","imgSub","imgAspect","imgMP","imgW","imgH","imgProfile"];
+const pickDefaults=state=>selectDefaults(state,DEFAULT_STATE_FIELDS);
+function loadDefaults(){
+  try{
+    const current=localStorage.getItem(DEFAULTS_LS_KEY);
+    if(current)return pickDefaults(JSON.parse(current));
+    const legacy=pickDefaults(JSON.parse(localStorage.getItem(LEGACY_LS_KEY)||"{}"));
+    localStorage.setItem(DEFAULTS_LS_KEY,JSON.stringify(legacy));
+    return legacy;
+  }catch(e){return{};}
+}
+function loadState(node){
+  return resolveNodeState(node?.properties,loadDefaults());
+}
+function saveState(s,node){
+  const state=cloneJSON(s);
+  node.properties=node.properties||{};
+  node.properties.h3one={schema:1,state};
+  const defaults=pickDefaults(state);
+  try{localStorage.setItem(DEFAULTS_LS_KEY,JSON.stringify(defaults));}catch(e){}
+}
 
 // -- Active refs + global API events ------------------------------------------
-let _activeNode=null;
-let _activeShowOutput=null;
-let _activeResetBtn=null;
-let _activeShowError=null;
-let _activeSetStage=null;
-let _activePromptId=null;
-let _activeShowTime=null;
-let _activeGenStartTs=0;
-let _activeShowLatest=null;
-let _activeShownFiles=[];
-let _batchIds=[];
-let _batchDone=0;
-const _batchCompleted=new Set();
 let _listenersRegistered=false;
-let _finishWatchTimer=null;
-let _finishDone=false;
+const _promptOwners=new Map();
+let _executingRuntime=null;
 
 // -- Finish watch: polls prompt history so the end-of-run UI never depends
 // on websocket events alone. The executed / execution_success listeners stay
 // as the fast path; this covers the rest.
-const _stopFinishWatch=()=>{
-  if(_finishWatchTimer!==null){ clearInterval(_finishWatchTimer); _finishWatchTimer=null; }
+const _stopFinishWatch=R=>{
+  if(R?.finishTimer!==null){ clearInterval(R.finishTimer); R.finishTimer=null; }
 };
-const _armFinishWatch=()=>{
-  _finishDone=false;
-  _stopFinishWatch();
-  _finishWatchTimer=setInterval(async()=>{
-    const node=_activeNode;
-    if(!node||!node._h3_S||node._h3_S.generating!==true||!_activePromptId){ _stopFinishWatch(); return; }
-    try{
-      const r=await api.fetchApi(`/history/${encodeURIComponent(_activePromptId)}`);
-      const h=await r.json();
-      if(h&&h[_activePromptId]){
-        _stopFinishWatch();
-        const activeIndex=_batchIds.indexOf(_activePromptId);
-        _batchIds.slice(0,activeIndex+1).forEach(id=>_batchCompleted.add(id));
-        _finishRun();
-      }
-    }catch(e){}
+const _armFinishWatch=R=>{
+  R.finishDone=false;
+  _stopFinishWatch(R);
+  R.finishTimer=setInterval(async()=>{
+    if(!R.node?._h3_S?.generating){_stopFinishWatch(R);return;}
+    for(const promptId of R.batchIds.filter(id=>!String(id).startsWith("pending-")&&!R.completed.has(id))){
+      try{
+        const h=await requestJSON(`/history/${encodeURIComponent(promptId)}`,{},true);
+        if(h?.[promptId])await _finishRun(R,promptId);
+      }catch(e){}
+    }
   },2500);
 };
-const _finishRun=async(promptId)=>{
-  if(_finishDone) return;
-  if(!_activeNode) return;
-  if(_activeNode._h3_S && _activeNode._h3_S.generating!==true) return;
+const _finishRun=async(R,promptId)=>{
+  if(!R||R.finishDone||!R.node?._h3_S?.generating)return;
   if(promptId){
-    if(!_batchIds.includes(promptId)||_batchCompleted.has(promptId)) return;
-    _batchCompleted.add(promptId);
-  }else if(_batchCompleted.size<_batchIds.length){
-    const next=_batchIds.find(id=>!_batchCompleted.has(id));
-    if(next) _batchCompleted.add(next);
+    if(!R.batchIds.includes(promptId)||R.completed.has(promptId))return;
+    if(!R.shownPrompts.has(promptId))await R.showLatest?.(promptId);
+    if(R.finishDone||R.completed.has(promptId))return;
+    R.completed.add(promptId);_promptOwners.delete(promptId);
   }
-  if(_batchIds.length){
-    _batchDone=_batchCompleted.size;
-    if(_batchDone<_batchIds.length){
-      _activeSetStage?.(`Done ${_batchDone}/${_batchIds.length}`,Math.round(_batchDone/_batchIds.length*100));
+  if(R.batchIds.length){
+    const done=R.completed.size;
+    if(done<R.batchIds.length){
+      R.setStage?.(`Done ${done}/${R.batchIds.length}`,Math.round(done/R.batchIds.length*100));
       return;
     }
   }
-  _finishDone=true;
-  _stopFinishWatch();
-  _activeSetStage?.("Done",100);
-  const _elapsed=Date.now()-_activeGenStartTs;
-  _activeShowTime?.(_elapsed);
-  let tries=0;
-  while(tries<12&&!_activeShownFiles.length){
-    await _activeShowLatest?.(_activePromptId);
-    if(_activeShownFiles.length) break;
-    tries++;
-    await new Promise(res=>setTimeout(res,1500));
-  }
-  if(_batchCompleted.size<_batchIds.length){ _finishDone=false; return; }
-  _activeResetBtn?.();
-  const S=_activeNode?._h3_S;
+  R.finishDone=true;_stopFinishWatch(R);
+  R.setStage?.("Done",100);R.showTime?.(Date.now()-R.genStartTs);R.reset?.();
+  const S=R.node?._h3_S;
   if(S && S.soundEnabled!==false && S.sound!=="off") playDone(S.sound||"chime");
 };
 
@@ -833,26 +839,21 @@ app.registerExtension({
     if(nodeData.name!=="H3OneNode") return;
 
     nodeType.prototype.onNodeCreated=function(){
-      try{
-        this.color=C.bg0;this.bgcolor=C.bg0;this.resizable=false;
-        if(this.widgets)this.widgets=[];
-        this._buildUI();
-      }catch(e){
-        console.error("[OneNode.MinimaxH3] onNodeCreated failed:",e);
-        console.error(e&&e.stack?e.stack:e);
-        try{
-          const errRoot=mk("div",{width:"100%",height:"560px",background:C.bg0,color:C.err,
-            fontSize:"11px",padding:"16px",boxSizing:"border-box",overflow:"auto",
-            fontFamily:"monospace",whiteSpace:"pre-wrap",lineHeight:"1.6"});
-          tx(errRoot,"ALL in ONE MiniMaxH3 - UI build error:\n\n"+String(e&&e.stack?e.stack:e));
-          this.addDOMWidget("h3_ui","div",errRoot,{
-            getValue(){return null;},setValue(){},serialize:false,
-            canvasOnly:!_isVueNodes(),
-            computeSize(){const sh=(typeof LiteGraph!=="undefined"&&LiteGraph.NODE_SLOT_HEIGHT)||20;return[NODE_W,NODE_H+sh*3];},
-          });
-          {const sh=(typeof LiteGraph!=="undefined"&&LiteGraph.NODE_SLOT_HEIGHT)||20;this.setSize([NODE_W,NODE_H+sh*3]);}
-        }catch(e2){ console.error("[OneNode.MinimaxH3] error display failed:",e2); }
-      }
+      this.color=C.bg0;this.bgcolor=C.bg0;this.resizable=false;
+      if(this.widgets)this.widgets=[];
+      queueMicrotask(()=>{
+        if(this._h3Removed)return;
+        try{ this._buildUI(); }
+        catch(e){
+          console.error("[OneNode.MinimaxH3] onNodeCreated failed:",e);
+          console.error(e&&e.stack?e.stack:e);
+          try{
+            const errRoot=mk("div",{width:"100%",height:"560px",background:C.bg0,color:C.err,fontSize:"11px",padding:"16px",boxSizing:"border-box",overflow:"auto",fontFamily:"monospace",whiteSpace:"pre-wrap",lineHeight:"1.6"});
+            tx(errRoot,"ALL in ONE MiniMaxH3 - UI build error:\n\n"+String(e&&e.stack?e.stack:e));
+            this.addDOMWidget("h3_ui","div",errRoot,{getValue(){return null;},setValue(){},serialize:false,canvasOnly:!_isVueNodes(),computeSize(){const sh=(typeof LiteGraph!=="undefined"&&LiteGraph.NODE_SLOT_HEIGHT)||20;return[NODE_W,NODE_H+sh*3];}});
+          }catch(e2){ console.error("[OneNode.MinimaxH3] error display failed:",e2); }
+        }
+      });
     };
 
     nodeType.prototype.onResize=function(){
@@ -860,9 +861,25 @@ app.registerExtension({
       this.size=[NODE_W,NODE_H+slotH*3];
     };
 
+    nodeType.prototype.onRemoved=function(){
+      this._h3Removed=true;
+      try{this._h3Life?.abort();}catch(e){}
+      try{this._h3ResizeObserver?.disconnect();}catch(e){}
+      try{this._h3ExitFullscreen?.();}catch(e){}
+      try{disposeChildren(this._h3Root);}catch(e){}
+      const R=this._h3Runtime;
+      if(R){_stopFinishWatch(R);R.batchIds?.forEach(id=>_promptOwners.delete(id));}
+      if(_executingRuntime===R)_executingRuntime=null;
+    };
+
     nodeType.prototype._buildUI=function(){
       const self=this;
-      const saved=loadState();
+      const saved=loadState(self);
+      const life=new AbortController();
+      self._h3Life=life;
+      let _capabilities=null;
+      const R={node:self,batchIds:[],completed:new Set(),shownPrompts:new Set(),finishTimer:null,finishDone:false,genStartTs:0};
+      self._h3Runtime=R;
       const _QF={
         turbo:{sol:false,cache:false,sage:false},
         speed:{sol:true,cache:true,sage:false},
@@ -916,10 +933,11 @@ app.registerExtension({
           resOrientation:  ["auto","landscape","portrait"].includes(saved.resOrientation)?saved.resOrientation:"auto",
           refImages:       Array.isArray(saved.refImages)?saved.refImages:[],
           refImageSizes:   saved.refImageSizes&&typeof saved.refImageSizes==="object"?saved.refImageSizes:{},
-          refVideos:       (Array.isArray(saved.refVideos)?saved.refVideos:[]).map(v=>(typeof v==="string")?{name:v,useAudio:false}:{name:(v&&v.name)||"",useAudio:!!(v&&v.useAudio)}),
+          refVideos:       (Array.isArray(saved.refVideos)?saved.refVideos:[]).map(v=>(typeof v==="string")?{name:v,useAudio:false,width:null,height:null}:{name:(v&&v.name)||"",useAudio:!!(v&&v.useAudio),width:Number(v&&v.width)||null,height:Number(v&&v.height)||null}),
           refAudios:       Array.isArray(saved.refAudios)?saved.refAudios:[],
           audioFile:       saved.audioFile||null,
           extendVideo:     saved.extendVideo||null,
+          extendVideoSize: saved.extendVideoSize||null,
           kf:              (Array.isArray(saved.kf)&&saved.kf.length)?saved.kf.map(k=>({img:k.img||null,pos:k.pos||0,width:Number(k.width)||null,height:Number(k.height)||null})):[{img:null,pos:1,width:null,height:null},{img:null,pos:62,width:null,height:null},{img:null,pos:124,width:null,height:null}],
           chainClips:      Array.isArray(saved.chainClips)&&saved.chainClips.length? saved.chainClips : [{prompt:"",duration:5},{prompt:"",duration:5}],
           models:          Object.assign({}, DEFAULT_MODELS, saved.models||{}),
@@ -932,8 +950,9 @@ app.registerExtension({
           customW:         saved.customW||960,
           customH:         saved.customH||544,
           resFitAspect:    saved.resFitAspect===true,
+          mediaFit:        ["crop","fit","stretch"].includes(saved.mediaFit)?saved.mediaFit:"crop",
           upscaleFactor:   Number(saved.upscaleFactor)||1.5,
-          upscaleMethod:   saved.upscaleMethod||"seedvr",
+          upscaleMethod:   saved.upscaleMethod==="rtx"?"rtx":"seedvr2",
           upscaleTemporal: UPSCALE_TEMPORAL[saved.upscaleTemporal]?saved.upscaleTemporal:"Balanced",
           upscaleTiling:   UPSCALE_TILING.includes(saved.upscaleTiling)?saved.upscaleTiling:"Auto",
           upscaleColor:    Object.prototype.hasOwnProperty.call(UPSCALE_COLOR,saved.upscaleColor)?saved.upscaleColor:"LAB",
@@ -984,13 +1003,13 @@ app.registerExtension({
           firstFrameOrientation:S.firstFrameOrientation,lastFrameOrientation:S.lastFrameOrientation,
           resOrientation:S.resOrientation,
           refImages:S.refImages,refImageSizes:S.refImageSizes,refVideos:S.refVideos,refAudios:S.refAudios,
-          audioFile:S.audioFile,extendVideo:S.extendVideo,
+          audioFile:S.audioFile,extendVideo:S.extendVideo,extendVideoSize:S.extendVideoSize,
           kf:(S.kf||[]).map(k=>({img:k.img||null,pos:k.pos||0,width:k.width||null,height:k.height||null})),
           models:S.models,speedLora:S.speedLora,audioOn:S.audioOn,
           soundEnabled:S.soundEnabled,sound:S.sound,accent:S.accent,mcLength:S.mcLength,
           upscaleFactor:S.upscaleFactor,upscaleMethod:S.upscaleMethod,upscaleTemporal:S.upscaleTemporal,upscaleTiling:S.upscaleTiling,upscaleColor:S.upscaleColor,
           modeSettings:S.modeSettings,
-          autoSave:S.autoSave,customW:S.customW,customH:S.customH,resFitAspect:S.resFitAspect,
+          autoSave:S.autoSave,customW:S.customW,customH:S.customH,resFitAspect:S.resFitAspect,mediaFit:S.mediaFit,
           playOnFinish:S.playOnFinish,folded:S.folded,livePreview:S.livePreview,
           imgSub:S.imgSub,imgAspect:S.imgAspect,imgMP:S.imgMP,imgW:S.imgW,imgH:S.imgH,
           imgProfile:S.imgProfile,imgRefs:S.imgRefs,
@@ -1106,6 +1125,7 @@ app.registerExtension({
         fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",
         color:C.text,overflow:"hidden",position:"relative"});
       root.classList.add("h3one-root");
+      self._h3Root=root;
 
       const _syncNodeRadius=()=>{
         const wrapper=root.parentElement;
@@ -1116,7 +1136,8 @@ app.registerExtension({
       requestAnimationFrame(()=>{
         _syncNodeRadius();
         if(typeof ResizeObserver!=="undefined"){
-          new ResizeObserver(_syncNodeRadius).observe(root.parentElement||root);
+          self._h3ResizeObserver=new ResizeObserver(_syncNodeRadius);
+          self._h3ResizeObserver.observe(root.parentElement||root);
         }
       });
 
@@ -1159,7 +1180,11 @@ app.registerExtension({
         b.innerHTML=`<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${MODE_ICONS[m.key]}</svg>`;
         b.appendChild(mk("span",{}, {textContent:MODE_SHORT[m.key]||m.label}));
         attachTip(b,MODE_HINTS[m.key]||"");
-        b.onclick=()=>{ _switchMode(m.key); };
+        b.onclick=()=>{
+          const capState=_capabilities?.modes?.[m.key];
+          if(capState&&!capState.available){showUnavailable(capState.reason||"This mode is unavailable.");return;}
+          clearUnavailable();modeDesc.style.color="";_switchMode(m.key);
+        };
         modeEls[m.key]=b;modesWrap.appendChild(b);
       });
       const navRow=mk("div",{}, {className:"h3-nav"});
@@ -1208,16 +1233,26 @@ app.registerExtension({
       const vaeARow=_mkModelRow("vaeAudio","Audio VAE");
       const taeRow=_mkModelRow("tae","Live Preview decoder (TAEH3)");
       taeRow.firstChild.appendChild(infoIcon("The tiny decoder used by the Live Preview toggle under the video. Every taeh3.safetensors found in a ComfyUI models/vae_approx folder is listed here. The node auto-picks one when your selection goes missing; change it here if you want a specific copy."));
+      const mediaFitWrap=mk("div",{marginBottom:"12px"});
+      const mediaFitCap=mk("div",{display:"flex",alignItems:"center",gap:"4px",marginBottom:"5px"});
+      mediaFitCap.append(cap("Media fit"),infoIcon("How images and reference-video frames are mapped to the generation canvas. Crop preserves proportions and fills the canvas; Fit preserves the full frame with black bars; Stretch keeps the legacy behaviour."));
+      const mediaFitLabels={crop:"Crop",fit:"Fit",stretch:"Stretch"};
+      const mediaFitDD=DD(Object.values(mediaFitLabels),mediaFitLabels[S.mediaFit]||"Crop",v=>{S.mediaFit=Object.keys(mediaFitLabels).find(k=>mediaFitLabels[k]===v)||"crop";persist();});
+      mediaFitWrap.append(mediaFitCap,mediaFitDD.el);
       const upMethodWrap=mk("div",{marginBottom:"12px"});
       const upMethodCapRow=mk("div",{display:"flex",alignItems:"center",gap:"4px"});
       const upMethodCap=mk("div",{fontSize:"9px",fontWeight:"700",letterSpacing:".1em",textTransform:"uppercase",color:C.muted});
       tx(upMethodCap,"Upscale method");
       upMethodCapRow.append(upMethodCap,infoIcon("Two upscalers - switch any time:\nRTX VSR: driver-accelerated, very fast, up to 4x, needs no model.\nSeedVR2: AI diffusion restorer, richer detail, slower, uses the DiT + VAE below."));
       upMethodWrap.appendChild(upMethodCapRow);
-      const upMethodDD=DD(["SeedVR2 (AI restore)","RTX VSR (fast)"],S.upscaleMethod==="rtx"?"RTX VSR (fast)":"SeedVR2 (AI restore)",v=>{
-        S.upscaleMethod=v==="RTX VSR (fast)"?"rtx":"seedvr";
+      const _upMethodItems=()=>[
+        {label:"SeedVR2 (AI restore)",value:"SeedVR2 (AI restore)",disabled:_capabilities&&!_capabilities.features?.seedvr2?.available,reason:_capabilities?.features?.seedvr2?.reason},
+        {label:"RTX VSR (fast)",value:"RTX VSR (fast)",disabled:_capabilities&&!_capabilities.features?.rtx_upscale?.available,reason:_capabilities?.features?.rtx_upscale?.reason},
+      ];
+      const upMethodDD=DD(_upMethodItems(),S.upscaleMethod==="rtx"?"RTX VSR (fast)":"SeedVR2 (AI restore)",v=>{
+        clearUnavailable();S.upscaleMethod=v==="RTX VSR (fast)"?"rtx":"seedvr2";
         persist();_syncUpscaleInfo();_updUpBtnTitle();
-      });
+      },reason=>showUnavailable(reason));
       upMethodWrap.appendChild(upMethodDD.el);
       const upTemporalWrap=mk("div",{marginBottom:"12px"});
       const upTemporalCap=mk("div",{display:"flex",alignItems:"center",gap:"4px",marginBottom:"5px"});
@@ -1288,7 +1323,7 @@ app.registerExtension({
       tx(supBtn,"Buy me a coffee");
       supBtn.onclick=()=>window.open(SUPPORT_URL,"_blank");
       supWrap.append(supCap,supBtn);
-      settingsOverlay.append(settHdr,unetT2VRow,unetR2VRow,clipRow,vaeVRow,vaeARow,taeRow,upMethodWrap,upTemporalWrap,upTilingWrap,upColorWrap,upDitRow,upVaeRow,upHint,speedLoraWrap,audioToggle.el,soundToggle.el,playOnFinishToggle.el,sndWrap,accWrap,supWrap);
+      settingsOverlay.append(settHdr,unetT2VRow,unetR2VRow,clipRow,vaeVRow,vaeARow,taeRow,mediaFitWrap,upMethodWrap,upTemporalWrap,upTilingWrap,upColorWrap,upDitRow,upVaeRow,upHint,speedLoraWrap,audioToggle.el,soundToggle.el,playOnFinishToggle.el,sndWrap,accWrap,supWrap);
 
       // -- HISTORY OVERLAY ---------------------------------------------------
       const historyOverlay=mk("div",{
@@ -1410,7 +1445,7 @@ app.registerExtension({
         const delBtn=mk("button",{background:"transparent",border:`1px solid rgba(220,80,80,.3)`,borderRadius:"6px",padding:"4px 12px",fontSize:"9px",fontWeight:"700",color:"rgba(220,80,80,.7)",cursor:"pointer",outline:"none"});
         tx(delBtn,"Delete entry");
         delBtn.onclick=async()=>{
-          await fetch(`/h3one/history/${it.id}`,{method:"DELETE"});
+          try{await requestJSON(`/h3one/history/${it.id}`,{method:"DELETE"});}catch(e){showError(fmtErr(e));return;}
           _histItems=_histItems.filter(x=>x.id!==it.id);
           if(_histOpenId===it.id)_histOpenId=null;
           _renderHistory(histSearch.value||"");
@@ -1421,7 +1456,7 @@ app.registerExtension({
       const _renderHistory=async(filter="")=>{
         histList.innerHTML="";
         let items=[];
-        try{const r=await fetch("/h3one/history");const d=await r.json();items=d.items||[];}catch(e){}
+        try{const d=await requestJSON("/h3one/history");items=d.items||[];}catch(e){showError(fmtErr(e));}
         _histItems=items;
         const f=(filter||"").toLowerCase();
         const vis=items.filter(it=>!f||(it.prompt+" "+it.mode+" "+(it.video||"")).toLowerCase().includes(f));
@@ -1458,7 +1493,7 @@ app.registerExtension({
           }
           if(it.video){
             const thumb=mk("video",{width:"64px",height:"36px",borderRadius:"6px",background:"#000",objectFit:"cover",border:`1px solid ${C.border}`,flexShrink:"0",pointerEvents:"none",display:"block"},{muted:true,preload:"metadata",playsInline:true});
-            thumb.src=api.apiURL(`/view?filename=${encodeURIComponent(it.video)}&type=output&subfolder=${encodeURIComponent(it.subfolder||"")}`);
+            thumb.src=api.apiURL(`/view?filename=${encodeURIComponent(it.video)}&type=${encodeURIComponent(it.type||"output")}&subfolder=${encodeURIComponent(it.subfolder||"")}`);
             thumb.addEventListener("loadeddata",()=>{ try{ thumb.currentTime=0.1; }catch(e){} });
             thumb.title=it.video;
             row.appendChild(thumb);
@@ -1510,7 +1545,7 @@ app.registerExtension({
       const lbOpen=mk("button",{background:C.bg2,border:`1px solid ${C.border}`,borderRadius:"6px",padding:"4px 10px",fontSize:"10px",fontWeight:"700",color:C.muted,cursor:"pointer",outline:"none"});
       tx(lbOpen,"Open folder");
       lbOpen.onclick=()=>{
-        if(_libCur)fetch("/h3one/open_folder",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({filename:_libCur.filename,subfolder:_libCur.subfolder||""})}).catch(()=>{});
+        if(_libCur)requestJSON("/h3one/open_folder",jsonOptions("POST",{filename:_libCur.filename,subfolder:_libCur.subfolder||"",type:_libCur.type||"output"})).catch(e=>showError(fmtErr(e)));
       };
       const lbDel=mk("button",{background:"transparent",border:`1px solid rgba(220,80,80,.4)`,borderRadius:"6px",padding:"4px 10px",fontSize:"10px",fontWeight:"700",color:"rgba(220,80,80,.8)",cursor:"pointer",outline:"none"});
       tx(lbDel,"Delete");
@@ -1572,9 +1607,7 @@ app.registerExtension({
         if(!_libCur) return;
         if(target!=="R2V reference video"&&target!=="Extend source video") return;
         try{
-          const stage=await fetch("/h3one/stage_input",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({filename:_libCur.filename,subfolder:_libCur.subfolder||"",type:_libCur.type||"output"})});
-          const sd=await stage.json();
-          if(!sd.ok) throw new Error(sd.error||"Could not copy the video to the input folder");
+          const sd=await requestJSON("/h3one/stage_input",jsonOptions("POST",{filename:_libCur.filename,subfolder:_libCur.subfolder||"",type:_libCur.type||"output"}));
           if(target==="R2V reference video"){
             if(S.refVideos.length>=3){ showError("R2V supports up to 3 reference videos. Remove one first."); return; }
             S.refVideos.push({name:sd.name,useAudio:false});
@@ -1593,10 +1626,9 @@ app.registerExtension({
       const _renderLibrary=async()=>{
         libGrid.innerHTML="";
         try{
-          const r=await fetch("/h3one/gallery");
-          const d=await r.json();
+          const d=await requestJSON("/h3one/gallery");
           _libItems=d.videos||[];
-        }catch(e){ _libItems=[]; }
+        }catch(e){ _libItems=[];showError(fmtErr(e)); }
         const vis=_libItems.filter(v=>!_libFavOnly||v.favorite);
         if(!vis.length){
           const empty=mk("div",{fontSize:"11px",color:C.muted,padding:"20px 0",textAlign:"center",gridColumn:"1 / -1"});
@@ -1623,6 +1655,7 @@ app.registerExtension({
       };
       const _libOpen=async(item)=>{
         _libCur=item;
+        const itemKey=mediaKey(item);
         tx(lbName,item.filename);
         tx(lbFav,item.favorite?"Unfavorite":"Favorite");
         tx(lbSeedVal,"?");
@@ -1630,20 +1663,19 @@ app.registerExtension({
         tx(lbTimeVal,"?");
         tx(lbPromptBox,"");
         lbPromptReuse.style.display="none";
-        if(_seedByFile[item.filename]!==undefined){
-          tx(lbSeedVal,String(_seedByFile[item.filename]));
+        if(_seedByFile[itemKey]!==undefined){
+          tx(lbSeedVal,String(_seedByFile[itemKey]));
         }
-        if(_genTimeByFile[item.filename]){
-          tx(lbTimeVal,fmtDur(_genTimeByFile[item.filename]));
+        if(_genTimeByFile[itemKey]){
+          tx(lbTimeVal,fmtDur(_genTimeByFile[itemKey]));
         }
         try{
-          const r=await fetch("/h3one/history");
-          const d=await r.json();
-          const hit=(d.items||[]).find(it=>it.video===item.filename);
+          const d=await requestJSON("/h3one/history");
+          const hit=(d.items||[]).find(it=>(it.media_key||mediaKey(it))===itemKey);
           if(hit){
-            if(hit.seed!==undefined&&hit.seed!==null){ _seedByFile[item.filename]=hit.seed; tx(lbSeedVal,String(hit.seed)); }
+            if(hit.seed!==undefined&&hit.seed!==null){ _seedByFile[itemKey]=hit.seed; tx(lbSeedVal,String(hit.seed)); }
             if(hit.mode){ tx(lbModeVal,_LIB_MODE_LBL[hit.mode]||hit.mode); }
-            if(hit.gen_time){ _genTimeByFile[item.filename]=hit.gen_time; tx(lbTimeVal,fmtDur(hit.gen_time)); }
+            if(hit.gen_time){ _genTimeByFile[itemKey]=hit.gen_time; tx(lbTimeVal,fmtDur(hit.gen_time)); }
             if(hit.prompt&&hit.prompt.trim()){
               tx(lbPromptBox,hit.prompt);
               lbPromptReuse.style.display="inline-block";
@@ -1670,15 +1702,18 @@ app.registerExtension({
       };
       lbFav.onclick=async()=>{
         if(!_libCur)return;
-        await fetch("/h3one/favorite",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({filename:_libCur.filename,favorite:!_libCur.favorite})}).catch(()=>{});
-        _libCur.favorite=!_libCur.favorite;
+        const next=!_libCur.favorite;
+        try{await requestJSON("/h3one/favorite",jsonOptions("POST",{filename:_libCur.filename,subfolder:_libCur.subfolder||"",type:_libCur.type||"output",favorite:next}));}
+        catch(e){showError(fmtErr(e));return;}
+        _libCur.favorite=next;
         tx(lbFav,_libCur.favorite?"Unfavorite":"Favorite");
         _renderLibrary();
       };
       lbDel.onclick=async()=>{
         if(!_libCur)return;
         if(!confirm("Delete "+_libCur.filename+"?"))return;
-        await fetch("/h3one/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({filename:_libCur.filename,subfolder:_libCur.subfolder||""})}).catch(()=>{});
+        try{await requestJSON("/h3one/delete",jsonOptions("POST",{filename:_libCur.filename,subfolder:_libCur.subfolder||"",type:_libCur.type||"output"}));}
+        catch(e){showError(fmtErr(e));return;}
         lbVideo.pause();lbVideo.src="";libLightbox.style.display="none";
         _libCur=null;_renderLibrary();_loadGallery();
       };
@@ -1775,7 +1810,7 @@ app.registerExtension({
       let _presetEditMode="";
       const _renderDiscover=async()=>{
         discBody.innerHTML="";
-        try{const r=await fetch("/h3one/config");const d=await r.json();_discTmpl=d.prompt_templates||{};_discCustom=d.custom_presets||{};}catch(e){_discTmpl={};_discCustom={};}
+        try{const d=await requestJSON("/h3one/config");_discTmpl=d.prompt_templates||{};_discCustom=d.custom_presets||{};}catch(e){_discTmpl={};_discCustom={};showError(fmtErr(e));}
         const t=_discTmpl[S.mode]||{presets:[]};
         const builtin=(t.presets||[]).filter(p=>!p.builtin_hidden);
         const note=mk("div",{fontSize:"9px",color:C.muted,lineHeight:"1.5",marginBottom:"2px"});
@@ -1836,12 +1871,7 @@ app.registerExtension({
           }
           saveBtn.disabled=true;tx(saveBtn,"Saving...");
           try{
-            if(_presetEditName && _presetEditName.toLowerCase()!==name.toLowerCase()){
-              await fetch("/h3one/presets",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({mode:saveMode,name:_presetEditName})}).catch(()=>{});
-            }
-            const r=await fetch("/h3one/presets",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mode:saveMode,name,prompt,original_name:_presetEditName||undefined})});
-            const d=await r.json();
-            if(!d.ok) throw new Error(d.error||"save failed");
+            await requestJSON("/h3one/presets",jsonOptions("POST",{mode:saveMode,name,prompt,original_name:_presetEditName||undefined}));
             const savedName=name;
             _presetEditName="";
             _presetEditMode="";
@@ -1853,6 +1883,7 @@ app.registerExtension({
             return;
           }catch(e){
             console.warn("[H3One] preset save:",e);
+            showError("Could not save preset: "+fmtErr(e));
             saveBtn.disabled=false;
             tx(saveBtn,"Failed - restart ComfyUI?");
             setTimeout(()=>tx(saveBtn,_presetEditName?"Update preset":"Save preset"),2600);
@@ -1898,8 +1929,8 @@ app.registerExtension({
             del.onclick=async()=>{
               if(!confirm("Delete preset \""+pr.name+"\" ("+(MODE_LABELS[pr.mode]||pr.mode)+")?"))return;
               try{
-                await fetch("/h3one/presets",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({mode:pr.mode,name:pr.name})});
-              }catch(e){console.warn("[H3One] preset delete:",e);}
+                await requestJSON("/h3one/presets",jsonOptions("DELETE",{mode:pr.mode,name:pr.name}));
+              }catch(e){showError("Could not delete preset: "+fmtErr(e));return;}
               _renderDiscover();
             };
             row.append(badge,name,use,edit,del);
@@ -2026,6 +2057,7 @@ app.registerExtension({
       const imgRefsBox=mk("div",{display:"flex",flexDirection:"column",gap:"6px"});
       imgArea.appendChild(imgRefsBox);
       const _renderImgRefs=()=>{
+        disposeChildren(imgRefsBox);
         imgRefsBox.innerHTML="";
         const sub=S.imgSub;
         if(sub==="t2i") return;
@@ -2055,7 +2087,7 @@ app.registerExtension({
                 persist();
               }catch(e){
                 console.warn("[H3One] image reference upload:",e);
-                _h3ShowError?.("Image upload failed: "+(e?.message||String(e)));
+                showError("Image upload failed: "+(e?.message||String(e)));
               }
               _renderImgRefs();
             };
@@ -2091,6 +2123,7 @@ app.registerExtension({
         if(S[orientationKey]===orientation&&((!size&&!prev)||(size&&prev&&size.width===prev.width&&size.height===prev.height))) return;
         S[orientationKey]=orientation;S[sizeKey]=size;persist();_refreshResolution();
       };
+      self._h3ExitFullscreen=_exitFullscreen;
       const firstSlot=ImgSlot(true,n=>{S.firstFrame=n;persist();},(w,h)=>_rememberFrameInfo("firstFrameOrientation","firstFrameSize",w,h));
       const lastSlot=ImgSlot(true,n=>{S.lastFrame=n;persist();},(w,h)=>_rememberFrameInfo("lastFrameOrientation","lastFrameSize",w,h));
       const i2vFramesRow=mk("div",{display:"flex",gap:"10px"});
@@ -2101,7 +2134,9 @@ app.registerExtension({
 
       const i2vGuidesBox=mk("div",{display:"flex",flexDirection:"column",gap:"7px",paddingTop:"7px",borderTop:`1px solid ${C.border}`});
       const _guideTimingSyncs=[];
+      let _syncGuideCapability=()=>{};
       const _renderI2VGuides=()=>{
+        disposeChildren(i2vGuidesBox);
         i2vGuidesBox.innerHTML="";
         _guideTimingSyncs.length=0;
         const hdr=mk("div",{display:"flex",alignItems:"center",gap:"7px"});
@@ -2110,10 +2145,20 @@ app.registerExtension({
         const hint=infoIcon("Native MiniMaxH3AddGuide anchors, chained after First/Last Frame conditioning. Disabled guides are kept in the UI but omitted from the workflow.");
         const add=mk("button",{marginLeft:"auto",background:"transparent",border:`1px dashed rgba(var(--h3accent-rgb),.4)`,borderRadius:"6px",padding:"4px 9px",fontSize:"8px",fontWeight:"700",color:"rgba(var(--h3accent-rgb),.8)",cursor:"pointer",outline:"none"},{type:"button"});
         tx(add,"+ Add Guide");
-        add.disabled=S.i2vGuides.length>=32;
-        add.style.opacity=add.disabled?".35":"1";
+        _syncGuideCapability=()=>{
+          const feature=_capabilities?.features?.guides;
+          const blocked=feature&&!feature.available;
+          add.disabled=S.i2vGuides.length>=32;
+          add.setAttribute("aria-disabled",blocked||add.disabled?"true":"false");
+          add.style.opacity=blocked||add.disabled?".35":"1";
+          add.title=blocked?(feature.reason||"MiniMaxH3AddGuide is unavailable"):(S.i2vGuides.length>=32?"Guide limit reached":"Add a temporal guide");
+        };
+        _syncGuideCapability();
         add.onclick=()=>{
+          const feature=_capabilities?.features?.guides;
+          if(feature&&!feature.available){showUnavailable(feature.reason||"MiniMaxH3AddGuide is unavailable");return;}
           if(S.i2vGuides.length>=32) return;
+          clearUnavailable();
           const at=Math.round(Math.min(Math.max(0,S.duration-.01),(S.i2vGuides.length+1)*3.5)*100)/100;
           S.i2vGuides.push({img:null,enabled:true,unit:"seconds",at,orientation:null,width:null,height:null});
           persist();_renderI2VGuides();
@@ -2174,13 +2219,14 @@ app.registerExtension({
           body.append(top,timing);
           row.append(slot.el,body);
           i2vGuidesBox.appendChild(row);
-        });
+        },self);
       };
       i2vArea.appendChild(i2vGuidesBox);
       _renderI2VGuides();
 
       // R2V refs
       const _renderRefs=()=>{
+        disposeChildren(refArea);
         refArea.innerHTML="";
         const imgCap=mk("div",{fontSize:"9px",fontWeight:"700",color:C.muted,textTransform:"uppercase",letterSpacing:".07em"});
         tx(imgCap,`Reference images (${S.refImages.length}/9)`);
@@ -2188,7 +2234,8 @@ app.registerExtension({
         const imgRow=mk("div",{display:"flex",gap:"8px",flexWrap:"wrap"});
         S.refImages.forEach((name,idx)=>{
           const slot=ImgSlot(false,n=>{ if(n===null){S.refImages.splice(idx,1);delete S.refImageSizes[name];} else { S.refImages[idx]=n; } persist();_renderRefs(); },(w,h)=>{
-            if(w&&h) S.refImageSizes[name]={width:w,height:h}; else delete S.refImageSizes[name];
+            const current=S.refImages[idx]||name;
+            if(w&&h) S.refImageSizes[current]={width:w,height:h}; else delete S.refImageSizes[current];
             persist();_refreshResolution();
           });
           imgRow.appendChild(slot.el);
@@ -2209,7 +2256,7 @@ app.registerExtension({
               persist();
             }catch(e){
               console.warn("[H3One] reference upload:",e);
-              _h3ShowError?.("Image upload failed: "+(e?.message||String(e)));
+              showError("Image upload failed: "+(e?.message||String(e)));
             }
             _renderRefs();
           };
@@ -2233,9 +2280,9 @@ app.registerExtension({
           const card=mk("div",{display:"flex",flexDirection:"column",gap:"3px",alignItems:"center"});
           const slot=MediaSlot("video",n=>{
             if(n===null){ S.refVideos.splice(idx,1); }
-            else { S.refVideos[idx]={name:n,useAudio:!!(S.refVideos[idx]&&S.refVideos[idx].useAudio)}; persist(); }
+            else { const old=S.refVideos[idx]||{};S.refVideos[idx]={name:n,useAudio:!!old.useAudio,width:old.width||null,height:old.height||null}; persist(); }
             _renderRefs();
-          });
+          },(w,h)=>{const current=S.refVideos[idx];if(current){current.width=w||null;current.height=h||null;persist();_refreshResolution();}});
           card.appendChild(slot);
           if(name) slot._restorePreview(name);
           if(!isAudioDrive){
@@ -2265,12 +2312,10 @@ app.registerExtension({
           document.body.appendChild(fi);
           fi.onchange=async()=>{
             if(!fi.files[0]){fi.remove();return;}
-            const fd=new FormData();fd.append("file",fi.files[0],fi.files[0].name);
             try{
-              const res=await fetch("/h3one/upload",{method:"POST",body:fd});
-              const d=await res.json();
-              if(d.ok){ S.refVideos.push({name:d.filename,useAudio:false}); persist(); _renderRefs(); }
-            }catch(e){ console.warn(e); }
+              const d=await _uploadMedia(fi.files[0]);
+              S.refVideos.push({name:d.filename,useAudio:false});persist();_renderRefs();
+            }catch(e){showError("Video upload failed: "+fmtErr(e));}
             fi.remove();
           };
           fi.click();
@@ -2300,12 +2345,10 @@ app.registerExtension({
             document.body.appendChild(fi);
             fi.onchange=async()=>{
               if(!fi.files[0]){fi.remove();return;}
-              const fd=new FormData();fd.append("file",fi.files[0],fi.files[0].name);
               try{
-                const res=await fetch("/h3one/upload",{method:"POST",body:fd});
-                const d=await res.json();
-                if(d.ok){ S.refAudios.push(d.filename); persist(); _renderRefs(); }
-              }catch(e){ console.warn(e); }
+                const d=await _uploadMedia(fi.files[0]);
+                S.refAudios.push(d.filename);persist();_renderRefs();
+              }catch(e){showError("Audio upload failed: "+fmtErr(e));}
               fi.remove();
             };
             fi.click();
@@ -2319,6 +2362,7 @@ app.registerExtension({
 
       // Keyframes
       const _renderKf=()=>{
+        disposeChildren(kfArea);
         kfArea.innerHTML="";
         const hdr=mk("div",{fontSize:"9px",fontWeight:"700",color:C.muted,textTransform:"uppercase",letterSpacing:".07em"});
         tx(hdr,`Keyframes (${S.kf.length})`);
@@ -2353,7 +2397,7 @@ app.registerExtension({
       if(S.audioFile) adSlot._restorePreview(S.audioFile);
 
       // Extend video slot
-      const exSlot=MediaSlot("video",n=>{S.extendVideo=n;persist();});
+      const exSlot=MediaSlot("video",n=>{S.extendVideo=n;if(!n)S.extendVideoSize=null;persist();},(w,h)=>{S.extendVideoSize=w&&h?{width:w,height:h}:null;persist();_refreshResolution();});
       exArea.append(_mkSlotCard("Video to extend",exSlot));
       if(S.extendVideo) exSlot._restorePreview(S.extendVideo);
 
@@ -2450,52 +2494,55 @@ app.registerExtension({
       paramsHdr.appendChild(paramsChev);
       const params=mk("div",{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px"});
       let _resItems=[];
-      const _effectiveResOrientation=()=>{
-        if(S.resOrientation!=="auto") return S.resOrientation;
-        if(S.mode==="i2v") return S.firstFrameOrientation||S.lastFrameOrientation||((S.i2vGuides||[]).find(g=>g.enabled!==false&&g.img&&g.orientation)||{}).orientation||"landscape";
+      const _effectiveResOrientation=(state=S)=>{
+        if(state.resOrientation!=="auto") return state.resOrientation;
+        if(state.mode==="i2v") return state.firstFrameOrientation||state.lastFrameOrientation||((state.i2vGuides||[]).find(g=>g.enabled!==false&&g.img&&g.orientation)||{}).orientation||"landscape";
         return "landscape";
       };
       const _validSize=s=>s&&Number(s.width)>0&&Number(s.height)>0?s:null;
       const _labeledSize=(s,label)=>{s=_validSize(s);return s?{width:Number(s.width),height:Number(s.height),label}:null;};
-      const _fitSourceSize=()=>{
-        if(S.mode==="i2v"){
-          if(S.firstFrame&&_validSize(S.firstFrameSize)) return _labeledSize(S.firstFrameSize,"First Frame");
-          if(S.lastFrame&&_validSize(S.lastFrameSize)) return _labeledSize(S.lastFrameSize,"Last Frame");
-          const index=(S.i2vGuides||[]).findIndex(g=>g.enabled!==false&&g.img&&g.width&&g.height);
-          return index>=0?_labeledSize(S.i2vGuides[index],`Guide ${index+1}`):null;
+      const _fitSourceSize=(state=S)=>{
+        if(state.mode==="i2v"){
+          if(state.firstFrame&&_validSize(state.firstFrameSize)) return _labeledSize(state.firstFrameSize,"First Frame");
+          if(state.lastFrame&&_validSize(state.lastFrameSize)) return _labeledSize(state.lastFrameSize,"Last Frame");
+          const index=(state.i2vGuides||[]).findIndex(g=>g.enabled!==false&&g.img&&g.width&&g.height);
+          return index>=0?_labeledSize(state.i2vGuides[index],`Guide ${index+1}`):null;
         }
-        if(S.mode==="keyframes"){
-          const k=(S.kf||[]).filter(x=>x.img&&x.width&&x.height).sort((a,b)=>(a.pos||0)-(b.pos||0))[0];
+        if(state.mode==="keyframes"){
+          const k=(state.kf||[]).filter(x=>x.img&&x.width&&x.height).sort((a,b)=>(a.pos||0)-(b.pos||0))[0];
           return _labeledSize(k,k?`Keyframe ${k.pos}`:"Keyframe");
         }
-        if(S.mode==="r2v"||S.mode==="audio_drive"){
-          const name=(S.refImages||[])[0];
-          return name?_labeledSize(S.refImageSizes[name],"Reference 1"):null;
+        if(state.mode==="r2v"||state.mode==="audio_drive"){
+          const name=(state.refImages||[])[0];
+          if(name&&_validSize(state.refImageSizes[name]))return _labeledSize(state.refImageSizes[name],"Reference 1");
+          const video=(state.refVideos||[]).find(v=>v&&v.name&&v.width&&v.height);
+          return video?_labeledSize(video,"Reference video"):null;
         }
+        if(state.mode==="extend"&&state.extendVideo)return _labeledSize(state.extendVideoSize,"Source video");
         return null;
       };
-      const _orientRes=(r)=>{
-        if(!r||_effectiveResOrientation()!=="portrait"||r.width<=r.height) return r;
+      const _orientRes=(r,state=S)=>{
+        if(!r||_effectiveResOrientation(state)!=="portrait"||r.width<=r.height) return r;
         return Object.assign({},r,{
           width:r.height,
           height:r.width,
           label:r.label.replace(/^\d+x\d+/,`${r.height}x${r.width}`),
         });
       };
-      const _shapeRes=(r)=>{
-        const source=S.resFitAspect?_fitSourceSize():null;
-        if(!r||!source) return _orientRes(r);
+      const _shapeRes=(r,state=S)=>{
+        const source=state.resFitAspect?_fitSourceSize(state):null;
+        if(!r||!source) return _orientRes(r,state);
         const fitted=fitResolutionToAspect(source.width,source.height,r.width,r.height);
         const detail=r.label.replace(/^\d+x\d+\s*/,"").replace(/^\(|\)$/g,"");
         return Object.assign({},r,fitted,{label:`${fitted.width}x${fitted.height} (Fit · ${detail})`});
       };
-      const _resolveRes=()=>{
-        if(S.resolution==="Custom"){
-          const w=Math.max(32,Math.min(16384,Math.round(S.customW/32)*32));
-          const h=Math.max(32,Math.min(16384,Math.round(S.customH/32)*32));
+      const _resolveRes=(state=S)=>{
+        if(state.resolution==="Custom"){
+          const w=Math.max(32,Math.min(16384,Math.round(state.customW/32)*32));
+          const h=Math.max(32,Math.min(16384,Math.round(state.customH/32)*32));
           return {width:w,height:h,label:`${w}x${h} (custom)`};
         }
-        return _shapeRes(_resItems.find(r=>r.label===S.resolution)||_resItems[0]||{width:960,height:544,label:S.resolution});
+        return _shapeRes(_resItems.find(r=>r.label===state.resolution)||_resItems[0]||{width:960,height:544,label:state.resolution},state);
       };
       const resRow=mk("div",{display:"flex",flexDirection:"column",gap:"3px"});
       const resCapRow=mk("div",{display:"flex",alignItems:"center",gap:"4px"});
@@ -2556,7 +2603,7 @@ app.registerExtension({
         fitInfo.style.display=fitting?"block":"none";
         if(fitting){
           if(source){
-            const r=_resolveRes(),mp=(r.width*r.height/1048576).toFixed(2);
+            const r=_resolveRes(),mp=(r.width*r.height/1000000).toFixed(2);
             tx(fitInfo,`${source.label} ${source.width}x${source.height} → canvas ${r.width}x${r.height} (${mp}MP)`);
             fitInfo.style.color=(Math.min(r.width,r.height)>768||Math.max(r.width,r.height)>1344)?C.warn:C.muted;
           }else{
@@ -2581,8 +2628,17 @@ app.registerExtension({
       const qualCapRow=mk("div",{display:"flex",alignItems:"center",gap:"4px"});
       const qualCap=mk("div",{fontSize:"10px",color:C.text});tx(qualCap,"Quality");
       qualCapRow.append(qualCap,infoIcon("The sampling pipeline, not the pixel size. Use the chips below to switch each accelerator on or off - Quality follows, and any manual mix shows as Custom.\nTurbo: Turbo LoRA + 6-step distilled sampler. Fastest, visibly lower quality - needs the Turbo LoRA set in Settings.\nSpeed: SolAttn + H3 block cache. Fastest normal pipeline, tiny quality tradeoff.\nBalanced: SolAttn sparse attention only.\nHigh Quality: full SageAttention only - slowest, maximum fidelity.\nNative: core ComfyUI H3 pipeline, no accelerators - needs no extra packs."));
-      const qualDD=DD(["Turbo (Speed LoRA)","Speed","Balanced","High Quality","Native","Custom"],_QL[S.quality]||"Custom",v=>{
+      const _featureForOpt={optSol:"sol",optCache:"cache",optSage:"sage"};
+      const _qualityItems=()=>[
+        {label:"Turbo (Speed LoRA)",value:"Turbo (Speed LoRA)",disabled:_capabilities&&!_capabilities.features?.turbo?.available,reason:_capabilities?.features?.turbo?.reason},
+        {label:"Speed",value:"Speed",disabled:_capabilities&&(!_capabilities.features?.sol?.available||!_capabilities.features?.cache?.available),reason:"Speed needs SolAttn and H3 Cache"},
+        {label:"Balanced",value:"Balanced",disabled:_capabilities&&!_capabilities.features?.sol?.available,reason:_capabilities?.features?.sol?.reason},
+        {label:"High Quality",value:"High Quality",disabled:_capabilities&&!_capabilities.features?.sage?.available,reason:_capabilities?.features?.sage?.reason},
+        "Native","Custom",
+      ];
+      const qualDD=DD(_qualityItems(),_QL[S.quality]||"Custom",v=>{
         const key=Object.keys(_QL).find(k=>_QL[k]===v)||"custom";
+        clearUnavailable();
         if(key!=="custom"){
           S.quality=key;
           const f=_QF[key]||{sol:false,cache:false,sage:false};
@@ -2594,7 +2650,7 @@ app.registerExtension({
         persist();
         if(S.quality==="turbo"){ stepsNI._inp.value="6"; S.steps=6; }
         if(typeof _syncLiveToggle==="function") _syncLiveToggle();
-      });
+      },reason=>showUnavailable(reason));
       qualRow.append(qualCapRow,qualDD.el);
       const optRow=mk("div",{display:"flex",gap:"5px",flexWrap:"wrap"});
       const _optChipSyncs=[];
@@ -2602,13 +2658,19 @@ app.registerExtension({
         const chip=mk("button",{borderRadius:"6px",padding:"3px 9px",fontSize:"9px",fontWeight:"700",cursor:"pointer",outline:"none",transition:"background .15s,color .15s,border-color .15s"});
         const _sync=()=>{
           const on=!!S[key];
+          const availability=_capabilities?.features?.[_featureForOpt[key]];
+          const blocked=availability&&!availability.available;
+          chip.disabled=false;chip.setAttribute("aria-disabled",blocked?"true":"false");chip.style.opacity=blocked?".45":"1";
           chip.style.background=on?C.lime:C.bg2;
           chip.style.color=on?"#111":C.muted;
           chip.style.border=`1px solid ${on?C.lime:C.border}`;
           tx(chip,(on?"✓ ":"· ")+label);
-          chip.title=(on?"Enabled":"Disabled")+" - click to "+(on?"disable":"enable");
+          chip.title=blocked?(availability.reason||`${label} is unavailable`):((on?"Enabled":"Disabled")+" - click to "+(on?"disable":"enable"));
         };
         chip.onclick=()=>{
+          const availability=_capabilities?.features?.[_featureForOpt[key]];
+          if(availability&&!availability.available){showUnavailable(availability.reason||`${label} is unavailable`);return;}
+          clearUnavailable();
           S[key]=!S[key];
           S.quality=_matchQ();
           qualDD.set(_QL[S.quality]);
@@ -2910,13 +2972,13 @@ app.registerExtension({
         cmpGenImg.style.width=(comparerWrap.offsetWidth||600)+"px";
         comparerWrap.setAttribute("aria-valuenow",String(Math.round(pct)));
       };
-      comparerWrap.addEventListener("mousedown",e=>{_cmpDragging=true;e.preventDefault();});
-      document.addEventListener("mousemove",e=>{
-        if(!_cmpDragging) return;
+      const _cmpMove=e=>{
+        if(!_cmpDragging)return;
         const r=comparerWrap.getBoundingClientRect();
         _cmpSetPct((e.clientX-r.left)/r.width*100);
-      });
-      document.addEventListener("mouseup",()=>{_cmpDragging=false;});
+      };
+      const _cmpUp=()=>{_cmpDragging=false;document.removeEventListener("mousemove",_cmpMove);document.removeEventListener("mouseup",_cmpUp);};
+      comparerWrap.addEventListener("mousedown",e=>{_cmpDragging=true;e.preventDefault();document.addEventListener("mousemove",_cmpMove,{signal:life.signal});document.addEventListener("mouseup",_cmpUp,{signal:life.signal});});
       comparerWrap.addEventListener("touchstart",()=>{_cmpDragging=true;},{passive:true});
       comparerWrap.addEventListener("touchmove",e=>{
         if(!_cmpDragging) return;
@@ -3037,28 +3099,28 @@ app.registerExtension({
       const timeLbl=mk("span",{fontSize:"9px",fontWeight:"700",letterSpacing:".05em",textTransform:"uppercase",color:C.muted});tx(timeLbl,"Generation time");
       const timeVal=mk("span",{fontSize:"11px",fontWeight:"700",color:C.lime,fontVariantNumeric:"tabular-nums"});tx(timeVal,"0s");
       timeBar.append(timeIco,timeLbl,timeVal);
-      const _updateTimeBar=(filename)=>{
-        const t=_genTimeByFile[filename];
+      const _updateTimeBar=(item)=>{
+        const key=mediaKey(item),t=_genTimeByFile[key];
         if(t){
           tx(timeVal,fmtDur(t));
           timeBar.style.display="flex";
           return;
         }
         timeBar.style.display="none";
-        _fetchTimeFromHistory(filename).then(t=>{
-          if(t && _curItem && _curItem.filename===filename){
-            _genTimeByFile[filename]=t;
+        _fetchTimeFromHistory(item).then(t=>{
+          if(t && _curItem && mediaKey(_curItem)===key){
+            _genTimeByFile[key]=t;
             tx(timeVal,fmtDur(t));
             timeBar.style.display="flex";
           }
         });
       };
       const showTime=(ms)=>{
-        if(ms>0&&_activeShownFiles.length){
-          const lastShown=_activeShownFiles[_activeShownFiles.length-1];
+        if(ms>0&&R.shownKeys?.length){
+          const lastShown=R.shownKeys[R.shownKeys.length-1];
           _genTimeByFile[lastShown]=ms;
         }
-        if(_curItem) _updateTimeBar(_curItem.filename);
+        if(_curItem) _updateTimeBar(_curItem);
       };
       const galleryBox=mk("div",{display:"flex",gap:"8px",overflowX:"auto",paddingBottom:"4px",scrollbarWidth:"thin"});
       const galleryHdr=mk("div",{display:"flex",alignItems:"center",justifyContent:"space-between",gap:"6px",padding:"2px 0 5px"});
@@ -3111,7 +3173,8 @@ app.registerExtension({
       const upInfo=mk("div",{display:"none",fontSize:"9px",color:C.muted,lineHeight:"1.45",padding:"0 2px",fontVariantNumeric:"tabular-nums"});
       const _currentUpscaleTarget=()=>_curItem?upscaleTarget(_curItem.width,_curItem.height,S.upscaleFactor):null;
       const _syncUpscaleInfo=()=>{
-        const target=_currentUpscaleTarget();
+        const snapshot=cloneJSON(S);
+        const target=upscaleTarget(_curItem.width,_curItem.height,snapshot.upscaleFactor);
         const video=!!(_curItem&&!_isImageItem(_curItem));
         upInfo.style.display=video?"block":"none";
         if(!video) return;
@@ -3144,13 +3207,10 @@ app.registerExtension({
           upBtn.classList.add("warn");
         }
       };
-      galleryActs.append(
-        actBtn("Favorite",()=>_favCurrent(),{icon:ICON_FAV}),
-        actBtn("Open",()=>_openCurrent(),{icon:ICON_OPEN}),
-        extendBtn,
-        upBtn,upFactorWrap,
-        actBtn("Delete",()=>_delCurrent(),{icon:ICON_DEL,danger:true})
-      );
+      const favBtn=actBtn("Favorite",()=>_favCurrent(),{icon:ICON_FAV});
+      const openBtn=actBtn("Open",()=>_openCurrent(),{icon:ICON_OPEN});
+      const delBtn=actBtn("Delete",()=>_delCurrent(),{icon:ICON_DEL,danger:true});
+      galleryActs.append(favBtn,openBtn,extendBtn,upBtn,upFactorWrap,delBtn);
       const saveTogBtn=mk("button",{}, {type:"button",className:"h3-actbtn"+(S.autoSave?" on":"")});
       saveTogBtn._lbl=mk("span",{}, {textContent:S.autoSave?"Save On":"Save Off"});
       saveTogBtn.appendChild(saveTogBtn._lbl);
@@ -3166,8 +3226,7 @@ app.registerExtension({
       const _checkTae=async()=>{
         let files=[];
         try{
-          const r=await fetch("/h3one/tae_status");
-          const d=await r.json();
+          const d=await requestJSON("/h3one/tae_status");
           files=Array.isArray(d.files)?d.files:[];
         }catch(e){ files=[]; }
         _taeFiles=files;
@@ -3239,12 +3298,15 @@ app.registerExtension({
       let _curItem=null;
       const _showVideo=(item,fromFinish)=>{
         _curItem=item;
+        const isTemp=(item.type||"output")==="temp";
+        favBtn.disabled=isTemp;favBtn.style.opacity=isTemp?".42":"1";
+        favBtn.title=isTemp?"Favorite is available only for saved outputs":"Favorite this output";
         extendBtn.style.display=_isImageItem(item)?"none":"";
         resolutionChip.style.display="none";
         _syncUpscaleInfo();_updUpBtnTitle();
         if(_cmpMode) _exitCompare();
         const imageCompare=S.mode==="image"&&["edit","refmix"].includes(S.imgSub)&&_cmpImageRefs.length>0&&_isImageItem(item);
-        const upscaleCompare=!!(_upResult&&item.filename===_upResult.filename);
+        const upscaleCompare=!!(_upResult&&mediaKey(item)===mediaKey(_upResult));
         cmpBtn.style.display=imageCompare||upscaleCompare?"block":"none";
         cmpSourceSelect.style.display="none";
         const vtype=item.type||"output";
@@ -3254,9 +3316,9 @@ app.registerExtension({
           imgEl.onload=()=>_updateResolutionChip(imgEl.naturalWidth,imgEl.naturalHeight);
           imgEl.src=url;imgEl.style.display="block";
           placeholder.style.display="none";errorBox.style.display="none";
-          _updateSeedChip(item.filename);
-          if(_seedByFile[item.filename]===undefined) _showSeedFromHistory(item.filename);
-          _updateTimeBar(item.filename);
+          _updateSeedChip(item);
+          if(_seedByFile[mediaKey(item)]===undefined) _showSeedFromHistory(item);
+          _updateTimeBar(item);
           return;
         }
         vidEl.src=url;vidEl.style.display="block";imgEl.style.display="none";
@@ -3269,9 +3331,9 @@ app.registerExtension({
         if(vidEl.readyState>=1) syncSize();
         else vidEl.addEventListener("loadedmetadata",syncSize,{once:true});
         placeholder.style.display="none";errorBox.style.display="none";
-        _updateSeedChip(item.filename);
-        if(_seedByFile[item.filename]===undefined) _showSeedFromHistory(item.filename);
-        _updateTimeBar(item.filename);
+        _updateSeedChip(item);
+        if(_seedByFile[mediaKey(item)]===undefined) _showSeedFromHistory(item);
+        _updateTimeBar(item);
         if(fromFinish&&S.playOnFinish===false){
           vidEl.muted=false;
           vidEl.load();
@@ -3288,9 +3350,7 @@ app.registerExtension({
         const label=extendBtn._lbl.textContent;
         extendBtn.disabled=true;tx(extendBtn._lbl,"Preparing...");
         try{
-          const response=await fetch("/h3one/stage_input",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({filename:_curItem.filename,subfolder:_curItem.subfolder||"",type:_curItem.type||"output"})});
-          const data=await response.json();
-          if(!response.ok||!data.ok) throw new Error(data.error||"Could not copy the video to the input folder");
+          const data=await requestJSON("/h3one/stage_input",jsonOptions("POST",{filename:_curItem.filename,subfolder:_curItem.subfolder||"",type:_curItem.type||"output"}));
           S.extendVideo=data.name;
           persist();
           exSlot._restorePreview(data.name);
@@ -3303,18 +3363,21 @@ app.registerExtension({
       };
       const _favCurrent=async()=>{
         if(!_curItem) return;
+        if((_curItem.type||"output")!=="output")return;
         const nf=!_curItem.favorite;
-        await fetch("/h3one/favorite",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({filename:_curItem.filename,favorite:nf})}).catch(()=>{});
-        _loadGallery();
+        try{await requestJSON("/h3one/favorite",jsonOptions("POST",{filename:_curItem.filename,subfolder:_curItem.subfolder||"",type:_curItem.type||"output",favorite:nf}));_curItem.favorite=nf;await _loadGallery();}
+        catch(e){showError(fmtErr(e));}
       };
-      const _openCurrent=()=>{
+      const _openCurrent=async()=>{
         if(!_curItem) return;
-        fetch("/h3one/open_folder",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({filename:_curItem.filename,subfolder:_curItem.subfolder||""})}).catch(()=>{});
+        try{await requestJSON("/h3one/open_folder",jsonOptions("POST",{filename:_curItem.filename,subfolder:_curItem.subfolder||"",type:_curItem.type||"output"}));}
+        catch(e){showError(fmtErr(e));}
       };
       const _delCurrent=async()=>{
         if(!_curItem) return;
         if(!confirm("Delete "+_curItem.filename+"?")) return;
-        await fetch("/h3one/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({filename:_curItem.filename,subfolder:_curItem.subfolder||""})}).catch(()=>{});
+        try{await requestJSON("/h3one/delete",jsonOptions("POST",{filename:_curItem.filename,subfolder:_curItem.subfolder||"",type:_curItem.type||"output"}));}
+        catch(e){showError(fmtErr(e));return;}
         vidEl.src="";vidEl.style.display="none";imgEl.src="";imgEl.style.display="none";placeholder.style.display="flex";resolutionChip.style.display="none";extendBtn.style.display="none";
         _curItem=null;
         _syncUpscaleInfo();_updUpBtnTitle();
@@ -3322,13 +3385,21 @@ app.registerExtension({
       };
       const _runUpscale=async()=>{
         if(!_curItem||_upscaleSubmitting||_generateSubmitting) return;
-        const target=_currentUpscaleTarget();
+        let snapshot;
+        try{
+          if(!_capabilities)await _loadCapabilities();
+          snapshot=cloneJSON(S);
+          const feature=snapshot.upscaleMethod==="rtx"?"rtx_upscale":"seedvr2";
+          const status=_capabilities.features?.[feature];
+          if(status&&!status.available)throw new Error(status.reason||`${feature} is unavailable`);
+        }catch(e){showError(fmtErr(e));return;}
+        const target=upscaleTarget(_curItem.width,_curItem.height,snapshot.upscaleFactor);
         if(!target){
           showError("Could not read the selected video's dimensions yet. Wait for the preview to load, then try Upscale again.");
           return;
         }
-        const rtx=S.upscaleMethod==="rtx";
-        if(!rtx && (!S.models.upscaleDit||S.models.upscaleDit==="none"||!S.models.upscaleVae||S.models.upscaleVae==="none")){
+        const rtx=snapshot.upscaleMethod==="rtx";
+        if(!rtx && (!snapshot.models.upscaleDit||snapshot.models.upscaleDit==="none"||!snapshot.models.upscaleVae||snapshot.models.upscaleVae==="none")){
           showError("Upscale needs a SeedVR2 model. Open Settings, then pick an Upscale DiT model + Upscale VAE - or switch the Upscale method to RTX VSR, which needs no model.");
           return;
         }
@@ -3336,45 +3407,35 @@ app.registerExtension({
         const source={filename:_curItem.filename,subfolder:_curItem.subfolder||"",type:_curItem.type||"output",width:_curItem.width,height:_curItem.height};
         const job={
           run:rtx?"upscale-rtx":"upscale-seedvr2",
-          orig:{filename:source.filename,subfolder:source.subfolder},
-          target:{...target,factor:S.upscaleFactor},
+          orig:{filename:source.filename,subfolder:source.subfolder,type:source.type},
+          target:{...target,factor:snapshot.upscaleFactor},
           started:Date.now(),
         };
         _upscaleSubmitting=true;
         upBtn.disabled=true;
-        _activeNode=self;
-        _activeShowOutput=showOutput;
-        _activeResetBtn=resetBtn;
-        _activeShowError=showError;
-        _activeSetStage=setStage;
-        _activeShowTime=showTime;
-        _activeShowLatest=showLatest;
         if(!joining){
           S.generating=true;
-          _activeGenStartTs=job.started;
-          _activeShownFiles=[];
-          _batchIds=[];_batchDone=0;_batchCompleted.clear();
+          R.genStartTs=job.started;R.shownPrompts.clear();R.shownKeys=[];
+          R.batchIds=[];R.completed.clear();R.finishDone=false;
           genBtn.disabled=true;tx(genBtnLbl,"Upscaling...");
           progWrap.style.display="flex";
         }
         const pendingId=`pending-upscale-${job.started}`;
-        _batchIds.push(pendingId);
+        R.batchIds.push(pendingId);
         setStage(joining?"Preparing another upscale...":"Preparing upscale...",3);
         try{
-          const stage=await fetch("/h3one/stage_input",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({filename:source.filename,subfolder:source.subfolder,type:source.type||"output"})});
-          const sd=await stage.json();
-          if(!sd.ok) throw new Error(sd.error||"Could not prepare the video for upscale");
+          const sd=await requestJSON("/h3one/stage_input",jsonOptions("POST",{filename:source.filename,subfolder:source.subfolder,type:source.type||"output"}));
           const wf=await _fetchTpl(rtx?"upscale_rtx.json":"upscale.json");
           wf["1"].inputs.file=sd.name;
           if(rtx){
-            wf["3"].inputs["resize_type.scale"]=S.upscaleFactor;
+            wf["3"].inputs["resize_type.scale"]=snapshot.upscaleFactor;
           }else{
-            wf["3"].inputs.model=S.models.upscaleDit;
-            const temporal=UPSCALE_TEMPORAL[S.upscaleTemporal]||UPSCALE_TEMPORAL.Balanced;
-            const tiling=resolveUpscaleTiling(S.upscaleTiling,target,temporal);
+            wf["3"].inputs.model=snapshot.models.upscaleDit;
+            const temporal=UPSCALE_TEMPORAL[snapshot.upscaleTemporal]||UPSCALE_TEMPORAL.Balanced;
+            const tiling=resolveUpscaleTiling(snapshot.upscaleTiling,target,temporal);
             const tileOverlap=Math.min(128,tiling.size/4);
             Object.assign(wf["4"].inputs,{
-              model:S.models.upscaleVae,
+              model:snapshot.models.upscaleVae,
               offload_device:"cpu",
               encode_tiled:tiling.encode,
               encode_tile_size:tiling.size,
@@ -3388,26 +3449,24 @@ app.registerExtension({
             wf["5"].inputs.batch_size=temporal.batch;
             wf["5"].inputs.uniform_batch_size=true;
             wf["5"].inputs.temporal_overlap=temporal.overlap;
-            wf["5"].inputs.color_correction=UPSCALE_COLOR[S.upscaleColor]||"lab";
+            wf["5"].inputs.color_correction=UPSCALE_COLOR[snapshot.upscaleColor]||"lab";
             wf["5"].inputs.offload_device="cpu";
             wf["5"].inputs.enable_debug=true;
           }
-          _applyAutoSave(wf);
+          _applyAutoSave(wf,snapshot);
           const body={prompt:wf,client_id:api.clientId,extra_data:{enable_previews:true}};
-          const res=await api.fetchApi("/prompt",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-          const data=await res.json();
+          const data=await requestJSON("/prompt",jsonOptions("POST",body),true);
           if(data.error||!data.prompt_id) throw new Error(data.error?.message||"Unknown error");
           _upscaleJobs.set(data.prompt_id,job);
-          const pendingIndex=_batchIds.indexOf(pendingId);
-          if(pendingIndex>=0) _batchIds[pendingIndex]=data.prompt_id;
-          else _batchIds.push(data.prompt_id);
-          _activePromptId=data.prompt_id;
-          _armFinishWatch();
-          setStage(`Queued ${_batchIds.length}: ${source.width}x${source.height} → ${target.width}x${target.height} with ${rtx?"RTX VSR":"SeedVR2"}`,8);
+          const pendingIndex=R.batchIds.indexOf(pendingId);
+          if(pendingIndex>=0) R.batchIds[pendingIndex]=data.prompt_id;
+          else R.batchIds.push(data.prompt_id);
+          _promptOwners.set(data.prompt_id,R);_armFinishWatch(R);
+          setStage(`Queued ${R.batchIds.length}: ${source.width}x${source.height} → ${target.width}x${target.height} with ${rtx?"RTX VSR":"SeedVR2"}`,8);
         }catch(e){
-          _batchIds=_batchIds.filter(id=>id!==pendingId);
+          R.batchIds=R.batchIds.filter(id=>id!==pendingId);
           if(!joining) resetBtn();
-          else if(_batchCompleted.size>=_batchIds.length) _finishRun();
+          else if(R.completed.size>=R.batchIds.length) _finishRun(R);
           showError(fmtErr(e));
         }finally{
           _upscaleSubmitting=false;
@@ -3417,10 +3476,9 @@ app.registerExtension({
       const _loadGallery=async()=>{
         galleryBox.innerHTML="";
         try{
-          const r=await fetch("/h3one/gallery");
-          const d=await r.json();
+          const d=await requestJSON("/h3one/gallery");
           _galItems=d.videos||[];
-        }catch(e){ _galItems=[]; }
+        }catch(e){ _galItems=[];showError(fmtErr(e)); }
         if(!_galItems.length){
           const empty=mk("div",{fontSize:"9px",color:C.muted,padding:"6px 0"});
           tx(empty,"No outputs yet.");
@@ -3467,12 +3525,12 @@ app.registerExtension({
 
       const resetBtn=()=>{
         S.generating=false;
-        _batchIds=[];_batchDone=0;
-        _batchCompleted.clear();
+        R.batchIds.forEach(id=>_promptOwners.delete(id));
+        R.batchIds=[];R.completed.clear();
         _upscaleJobs.clear();
         _generationJobs.clear();
-        _activePromptId=null;
-        _stopFinishWatch();
+        _stopFinishWatch(R);
+        if(_executingRuntime===R)_executingRuntime=null;
         self._h3_lpOn=false;
         _showLiveChip(false);
         genBtn.disabled=false;
@@ -3482,20 +3540,24 @@ app.registerExtension({
         stopBtn.style.maxWidth="0";stopBtn.style.minWidth="0";stopBtn.style.width="0";stopBtn.style.opacity="0";stopBtn.style.padding="0";stopBtn.style.marginLeft="0";
         progWrap.style.display="none";progFill.style.width="0%";
       };
-      const showError=(msg)=>{
+      let _contextError=false;
+      const showError=(msg,preservePreview=false)=>{
+        _contextError=preservePreview;
         errorBox.style.display="flex";
         errorBox.innerHTML="";
         resolutionChip.style.display="none";
         const title=mk("div",{fontSize:"12px",fontWeight:"700",color:C.err,letterSpacing:".02em",marginBottom:"6px"});
-        tx(title,"Something went wrong");
+        tx(title,preservePreview?"Unavailable":"Something went wrong");
         const body=mk("div",{fontSize:"11px",color:C.text,lineHeight:"1.6",whiteSpace:"pre-wrap",wordBreak:"break-word",maxWidth:"100%"});
         tx(body,fmtErr(msg));
         errorBox.append(title,body);
-        vidEl.style.display="none";imgEl.style.display="none";placeholder.style.display="none";
+        if(!preservePreview){vidEl.style.display="none";imgEl.style.display="none";placeholder.style.display="none";}
       };
-      _h3ShowError=showError;
+      const showUnavailable=msg=>showError(msg,true);
+      const clearUnavailable=()=>{if(_contextError){errorBox.style.display="none";_contextError=false;if(_curItem)_updateResolutionChip(_curItem.width,_curItem.height);}};
+      root.addEventListener("h3-error",e=>showError(e.detail),{signal:life.signal});
       const showOutput=(item,promptId)=>{
-        errorBox.style.display="none";
+        errorBox.style.display="none";_contextError=false;
         const upscaleJob=promptId?_upscaleJobs.get(promptId):null;
         const generationJob=promptId?_generationJobs.get(promptId):null;
         if(upscaleJob){
@@ -3508,38 +3570,37 @@ app.registerExtension({
           _syncCompareSourceSelect();
         }
         const outputSeed=generationJob?.seed??S.seed;
-        if(outputSeed!==undefined&&outputSeed!==null&&outputSeed!=="") _seedByFile[item.filename]=outputSeed;
-        const genMs=Date.now()-(upscaleJob?.started||generationJob?.started||_activeGenStartTs);
-        _genTimeByFile[item.filename]=genMs;
+        const itemKey=mediaKey(item);
+        if(outputSeed!==undefined&&outputSeed!==null&&outputSeed!=="") _seedByFile[itemKey]=outputSeed;
+        const genMs=Date.now()-(upscaleJob?.started||generationJob?.started||R.genStartTs);
+        _genTimeByFile[itemKey]=genMs;
         const wasUpscale=upscaleJob?.run||"";
         if(wasUpscale&&_upOrig){
-          _upResult={filename:item.filename,subfolder:item.subfolder||""};
+          _upResult={filename:item.filename,subfolder:item.subfolder||"",type:item.type||"output"};
         }
         _showVideo(item,true);
-        if(_upResult&&_upResult.filename===item.filename){
+        if(_upResult&&mediaKey(_upResult)===mediaKey(item)){
           cmpBtn.style.display="block";
         }
-        if(promptId){ _upscaleJobs.delete(promptId);_generationJobs.delete(promptId); }
-        _activeShownFiles.push(item.filename);
+        if(promptId){_upscaleJobs.delete(promptId);_generationJobs.delete(promptId);R.shownPrompts.add(promptId);}
+        R.shownKeys.push(itemKey);
         const isTemp=item.type==="temp";
         if(!isTemp){
-          fetch("/h3one/set_output",{method:"POST",headers:{"Content-Type":"application/json"},
-            body:JSON.stringify({node_id:self.id,info:{filename:item.filename,subfolder:item.subfolder||""}})}).catch(()=>{});
-          const histMode=wasUpscale?("Upscale "+(_upTarget?.factor??S.upscaleFactor)+"x ("+(wasUpscale==="upscale-rtx"?"RTX VSR":"SeedVR2")+")"):(generationJob?.mode||S.mode);
-          const histRes=wasUpscale&&_upTarget?(`${_upTarget.width}x${_upTarget.height} (${_upTarget.factor}x)`):(wasUpscale?(S.upscaleFactor+"x upscale"):(generationJob?.resolution||(S.mode==="image"?(S.imgLastW+"x"+S.imgLastH):S.resolution)));
-           fetch("/h3one/history",{method:"POST",headers:{"Content-Type":"application/json"},
-             body:JSON.stringify({
-               mode:histMode,quality:wasUpscale?"":(generationJob?.quality||S.quality),prompt:((generationJob?.prompt??S.prompt)||"").slice(0,2000),duration:wasUpscale?0:(generationJob?.duration??S.duration),
-               resolution:histRes,seed:outputSeed,gen_time:genMs,video:item.filename,subfolder:item.subfolder||"",type:item.type||"output",
-               kind:item.kind==="image"?"image":"video",
-             })}).catch(()=>{});
+          requestJSON("/h3one/set_output",jsonOptions("POST",{node_id:self.id,info:{filename:item.filename,subfolder:item.subfolder||""}})).catch(e=>console.warn("[H3One] set output:",e));
         }
+        const histMode=wasUpscale?("Upscale "+(_upTarget?.factor??S.upscaleFactor)+"x ("+(wasUpscale==="upscale-rtx"?"RTX VSR":"SeedVR2")+")"):(generationJob?.mode||S.mode);
+        const histRes=wasUpscale&&_upTarget?(`${_upTarget.width}x${_upTarget.height} (${_upTarget.factor}x)`):(wasUpscale?(S.upscaleFactor+"x upscale"):(generationJob?.resolution||(S.mode==="image"?(S.imgLastW+"x"+S.imgLastH):S.resolution)));
+        requestJSON("/h3one/history",jsonOptions("POST",{
+          mode:histMode,quality:wasUpscale?"":(generationJob?.quality||S.quality),prompt:((generationJob?.prompt??S.prompt)||"").slice(0,2000),duration:wasUpscale?0:(generationJob?.duration??S.duration),
+          resolution:histRes,seed:outputSeed,gen_time:genMs,video:item.filename,filename:item.filename,subfolder:item.subfolder||"",type:item.type||"output",
+          kind:item.kind==="image"?"image":"video",prompt_id:promptId||"",
+        })).catch(e=>console.warn("[H3One] history save:",e));
         _loadGallery();
       };
       const _genTimeByFile={};
       const _seedByFile={};
-      const _updateSeedChip=(filename)=>{
-        let seed=_seedByFile[filename];
+      const _updateSeedChip=(item)=>{
+        let seed=_seedByFile[mediaKey(item)];
         if(seed===undefined||seed===null||seed===""){
           seedChip.style.display="none";
           return;
@@ -3547,54 +3608,59 @@ app.registerExtension({
         tx(seedChipVal,String(seed));
         seedChip.style.display="flex";
       };
-      const _showSeedFromHistory=async(filename)=>{
+      const _showSeedFromHistory=async(item)=>{
         try{
-          const r=await fetch("/h3one/history");
-          const d=await r.json();
-          const hit=(d.items||[]).find(it=>it.video===filename);
+          const d=await requestJSON("/h3one/history");
+          const key=mediaKey(item),hit=(d.items||[]).find(it=>(it.media_key||mediaKey(it))===key);
           if(hit&&hit.seed!==undefined&&hit.seed!==null){
-            _seedByFile[filename]=hit.seed;
-            _updateSeedChip(filename);
+            _seedByFile[key]=hit.seed;
+            _updateSeedChip(item);
           }
         }catch(e){}
       };
-      const _fetchTimeFromHistory=async(filename)=>{
+      const _fetchTimeFromHistory=async(item)=>{
         try{
-          const r=await fetch("/h3one/history");
-          const d=await r.json();
-          const hit=(d.items||[]).find(it=>it.video===filename);
+          const d=await requestJSON("/h3one/history");
+          const key=mediaKey(item),hit=(d.items||[]).find(it=>(it.media_key||mediaKey(it))===key);
           return hit&&hit.gen_time? hit.gen_time : null;
         }catch(e){ return null; }
       };
       const showLatest=async(promptId)=>{
-        if(_activeShownFiles.length) return;
         try{
-          const r=await fetch("/h3one/gallery");
-          const d=await r.json();
-          const items=d.videos||[];
-          if(!items.length) return;
-          showOutput(items[0],promptId);
-        }catch(e){}
+          const history=await requestJSON(`/history/${encodeURIComponent(promptId)}`,{},true);
+          const outputs=history?.[promptId]?.outputs||{};
+          const candidates=[];
+          Object.values(outputs).forEach(out=>{
+            (out.videos||out.gifs||[]).forEach(item=>candidates.push({...item,kind:"video"}));
+            (out.images||[]).forEach(item=>candidates.push({...item,kind:out.animated?.length?"video":"image"}));
+          });
+          if(candidates.length)showOutput(candidates[candidates.length-1],promptId);
+        }catch(e){showError("Could not load the exact output for this queued job: "+fmtErr(e));}
       };
+      Object.assign(R,{reset:resetBtn,showOutput,showError,setStage,showTime,showLatest});
 
       // -- WORKFLOW BUILDERS -------------------------------------------------
       const _fetchTpl=async(name)=>{
-        const res=await fetch(`/h3one/workflow/${name}`);
-        if(!res.ok) throw new Error("Failed to load workflow template: "+name);
-        return await res.json();
+        return await requestJSON(`/h3one/workflow/${name}`);
       };
 
-      const _finalPrompt=(userText,tplKey)=>{
+      const _fitMediaLink=(wf,link,newId,res,title,state=S)=>{
+        const id=newId();
+        wf[id]={class_type:"H3MediaFit",inputs:{image:link,width:res.width,height:res.height,mode:state.mediaFit||"crop"},_meta:{title:title||"Fit Media"}};
+        return [id,0];
+      };
+
+      const _finalPrompt=(userText,tplKey,state=S)=>{
         let text=(userText||"").trim();
         if(!text) return "";
-        if(S.mode==="extend"){
+        if(state.mode==="extend"){
           const airlock="Hold the exact closing framing of the source video for about 2 seconds - same camera, same subject position, same lighting and same motion - then continue seamlessly with no visible cut: ";
           if(text.includes("integrated_multimodal_description")){
             text=text.replace(/\[Shot 1\]\s*/i, "[Shot 1] "+airlock);
           }
         }
         if(text.includes("integrated_multimodal_description")||text.includes("summary:")||text.includes("detailed_description:")){
-          if(S.mode==="r2v"&&S.refAudios.length&&!text.includes("<Audio")){
+          if(state.mode==="r2v"&&state.refAudios.length&&!text.includes("<Audio")){
             text=text.replace(/(retention_analysis:\s*)/i, "$1<Audio 1>: fully_copy - reused 1:1 as the target video's complete final audio track.\n");
             if(!/<Audio/.test(text.split("overall_soundscape:")[1]||"")){
               text=text.replace(/(overall_soundscape:\s*)/i, "$1The copied audio track <Audio 1> is the complete soundtrack. ");
@@ -3602,7 +3668,7 @@ app.registerExtension({
           }
           return text;
         }
-        const mode=tplKey||S.mode;
+        const mode=tplKey||state.mode;
         const tpl=_discTmpl[mode==="chain"?"chain":mode]||{};
         const wrap=tpl.wrap;
         if(!wrap) return text;
@@ -3616,37 +3682,37 @@ app.registerExtension({
       // H3CacheBust sits between the CLIP loader and the conditioning node and
       // invalidates everything downstream whenever any input that matters
       // (prompt, media names, media file CONTENT, seed, steps, geometry) changes.
-      const _buildFingerprint=(extra)=>{
+      const _buildFingerprint=(extra,state=S)=>{
         const files=[];
         const add=(type,name)=>{ if(name) files.push({type,name}); };
-        add("image",S.firstFrame); add("image",S.lastFrame);
-        (S.i2vGuides||[]).forEach(g=>add("image",g.img));
-        (S.refImages||[]).forEach(n=>add("image",n));
-        (S.refVideos||[]).forEach(v=>{ const n=(typeof v==="string")?v:v&&v.name; add("video",n); });
-        (S.refAudios||[]).forEach(n=>add("audio",n));
-        add("audio",S.audioFile);
-        add("video",S.extendVideo);
-        (S.kf||[]).forEach(k=>add("image",k.img));
+        add("image",state.firstFrame); add("image",state.lastFrame);
+        (state.i2vGuides||[]).forEach(g=>add("image",g.img));
+        (state.refImages||[]).forEach(n=>add("image",n));
+        (state.refVideos||[]).forEach(v=>{ const n=(typeof v==="string")?v:v&&v.name; add("video",n); });
+        (state.refAudios||[]).forEach(n=>add("audio",n));
+        add("audio",state.audioFile);
+        add("video",state.extendVideo);
+        (state.kf||[]).forEach(k=>add("image",k.img));
         if(Array.isArray(extra)) extra.forEach(f=>files.push(f));
-        const res=_resolveRes();
+        const res=_resolveRes(state);
         const fp={
-          prompt:_finalPrompt(S.prompt),
+          prompt:_finalPrompt(state.prompt,undefined,state),
           files,
-          seed:S.seed||0,
-          steps:S.steps,
+          seed:state.seed||0,
+          steps:state.steps,
           width:res.width,
           height:res.height,
-          i2vGuides:(S.i2vGuides||[]).map(g=>({img:g.img||"",enabled:g.enabled!==false,unit:g.unit,at:Number(g.at)||0})),
-          kf:(S.kf||[]).map(k=>({img:k.img||"",pos:Math.round(k.pos||0)})),
+          i2vGuides:(state.i2vGuides||[]).map(g=>({img:g.img||"",enabled:g.enabled!==false,unit:g.unit,at:Number(g.at)||0})),
+          kf:(state.kf||[]).map(k=>({img:k.img||"",pos:Math.round(k.pos||0)})),
         };
         return JSON.stringify(fp);
       };
 
-      const _insertCacheBust=(wf,fp)=>{
+      const _insertCacheBust=(wf,fp,state=S)=>{
         const clipId=Object.keys(wf).find(id=>wf[id]&&wf[id].class_type==="CLIPLoader");
         if(!clipId) return;
         const bustId="499";
-        wf[bustId]={class_type:"H3CacheBust",inputs:{clip:[clipId,0],fingerprint:fp||_buildFingerprint()},_meta:{title:"Cache Invalidation"}};
+        wf[bustId]={class_type:"H3CacheBust",inputs:{clip:[clipId,0],fingerprint:fp||_buildFingerprint(undefined,state)},_meta:{title:"Cache Invalidation"}};
         Object.keys(wf).forEach(id=>{
           if(id===bustId) return;
           const n=wf[id];
@@ -3658,37 +3724,47 @@ app.registerExtension({
         });
       };
 
-      const _insertModelPatches=(wf)=>{
+      const _solPatch=(model)=>{
+        if(selectSolProvider(_capabilities)==="saganaki"){
+          return {class_type:"MiniMaxH3MemoryEfficientSolAttentionPatch",inputs:{
+            model,enabled:true,tau:1.3,min_tokens:4096,strict:false,thresh_type:"diag",
+            int8_qk:false,int8_pv:false,sink_conditioning:"exact_kv",dense_blocks:"",
+          },_meta:{title:"Sol-Attn (H3 memory efficient)"}};
+        }
+        return {class_type:"SolAttnPatch",inputs:{
+          model,tau:1.3,start_percent:0.2,end_percent:0.9,min_tokens:4096,
+          int8_qk:true,sink_conditioning:"exact_kv_and_rows",morton:false,
+          morton_curve:"2d_frame",int8_pv:true,verbose:true,use_tma:false,dense_blocks:"",
+        },_meta:{title:"Sol-Attn"}};
+      };
+
+      const _insertModelPatches=(wf,state=S)=>{
         let modelSrc=["2",0];
         let nextId=100;
         const newId=()=>String(nextId++);
-        const actives=S.loras.filter(l=>l.name&&l.enabled!==false);
+        const actives=state.loras.filter(l=>l.name&&l.enabled!==false);
         actives.forEach(lr=>{
           const id=newId();
           wf[id]={class_type:"LoraLoaderModelOnly",inputs:{model:modelSrc,lora_name:lr.name,strength_model:lr.strength},_meta:{title:"LoRA"}};
           modelSrc=[id,0];
         });
-        const q=S.quality;
+        const q=state.quality;
         if(q==="turbo"){
-          if(!S.speedLora) throw new Error("Turbo preset needs a Turbo LoRA - set one in Settings (Speed LoRA) or pick another quality.");
+          if(!state.speedLora) throw new Error("Turbo preset needs a Turbo LoRA - set one in Settings (Speed LoRA) or pick another quality.");
           {
             const tl=newId();
-            wf[tl]={class_type:"MiniMaxH3TurboLoRA",inputs:{model:modelSrc,lora_name:S.speedLora,strength:1,low_vram:false},_meta:{title:"Turbo LoRA"}};
+            wf[tl]={class_type:"MiniMaxH3TurboLoRA",inputs:{model:modelSrc,lora_name:state.speedLora,strength:1,low_vram:false},_meta:{title:"Turbo LoRA"}};
             modelSrc=[tl,0];
           }
           const ts=newId();
           wf[ts]={class_type:"MiniMaxH3TurboSampler",inputs:{},_meta:{title:"Turbo Sampler"}};
           wf["10"]=wf[ts];delete wf[ts];
-          wf["9"].inputs.steps=S.steps||6;
+          wf["9"].inputs.steps=state.steps||6;
         } else {
-          const useSol=!!S.optSol, useCache=!!S.optCache, useSage=!!S.optSage;
+          const useSol=!!state.optSol, useCache=!!state.optCache, useSage=!!state.optSage;
           const insSol=()=>{
             const sol=newId();
-            wf[sol]={class_type:"SolAttnPatch",inputs:{
-              model:modelSrc,tau:1.3,start_percent:0.2,end_percent:0.9,min_tokens:4096,
-              int8_qk:true,sink_conditioning:"exact_kv_and_rows",morton:false,
-              morton_curve:"2d_frame",int8_pv:true,verbose:true,use_tma:false,dense_blocks:"",
-            },_meta:{title:"Sol-Attn"}};
+            wf[sol]=_solPatch(modelSrc);
             modelSrc=[sol,0];
           };
           const insCache=()=>{
@@ -3714,16 +3790,16 @@ app.registerExtension({
             if(useCache) insCache();
             if(useSage) insSage();
           }
-          wf["9"].inputs.steps=S.steps;
+          wf["9"].inputs.steps=state.steps;
         }
         wf["5"].inputs.model=modelSrc;
       };
 
-      const _insertImageModelPatches=(wf)=>{
+      const _insertImageModelPatches=(wf,state=S)=>{
         let modelSrc=["3",0];
         let nextId=100;
         const newId=()=>String(nextId++);
-        S.loras.filter(l=>l.name&&l.enabled!==false).forEach(lr=>{
+        state.loras.filter(l=>l.name&&l.enabled!==false).forEach(lr=>{
           const id=newId();
           wf[id]={class_type:"LoraLoaderModelOnly",inputs:{model:modelSrc,lora_name:lr.name,strength_model:lr.strength},_meta:{title:"LoRA"}};
           modelSrc=[id,0];
@@ -3732,10 +3808,14 @@ app.registerExtension({
         wf["6"].inputs.model=["4",0];
       };
 
-      const _applyAutoSave=(wf)=>{
-        if(S.autoSave!==false) return;
+      const _applyAutoSave=(wf,state=S)=>{
+        if(state.autoSave!==false) return;
         Object.keys(wf).forEach(id=>{
           const n=wf[id];
+          if(n.class_type==="H3StudioSaveImage"){
+            wf[id]={class_type:"PreviewImage",inputs:{images:n.inputs.images},_meta:{title:"Preview (no save)"}};
+            return;
+          }
           if(n.class_type!=="SaveVideo") return;
           const src=(n.inputs.video||[])[0];
           const cv=src?wf[src]:null;
@@ -3755,56 +3835,56 @@ app.registerExtension({
         });
       };
 
-      const _patchCommon=(wf)=>{
-        wf["1"].inputs.clip_name=S.models.clip;
+      const _patchCommon=(wf,state=S)=>{
+        wf["1"].inputs.clip_name=state.models.clip;
         const condNode=wf["6"];
         const isR2V=condNode&&condNode.class_type==="MiniMaxH3ReferenceToVideo";
-        wf["2"].inputs.unet_name= isR2V&&(S.mode==="r2v"||S.mode==="audio_drive")? S.models.unetR2V : S.models.unetT2V;
-        wf["3"].inputs.vae_name=S.models.vaeVideo;
-        wf["4"].inputs.vae_name=S.models.vaeAudio;
-        const res=_resolveRes();
-        let frames=snapFrames(S.duration);
-        if(S.mode==="extend"){
+        wf["2"].inputs.unet_name= isR2V&&(state.mode==="r2v"||state.mode==="audio_drive")? state.models.unetR2V : state.models.unetT2V;
+        wf["3"].inputs.vae_name=state.models.vaeVideo;
+        wf["4"].inputs.vae_name=state.models.vaeAudio;
+        const res=_resolveRes(state);
+        let frames=snapFrames(state.duration);
+        if(state.mode==="extend"){
           const EXT_CONTEXT=90;
-          frames=snapFrames(S.duration+EXT_CONTEXT/24);
+          frames=snapFrames(state.duration+EXT_CONTEXT/24);
         }
-        condNode.inputs.prompt=_finalPrompt(S.prompt);
+        condNode.inputs.prompt=_finalPrompt(state.prompt,undefined,state);
         condNode.inputs.width=res.width;
         condNode.inputs.height=res.height;
         condNode.inputs.length=frames;
-        wf["8"].inputs.noise_seed=S.seed||0;
-        wf["9"].inputs.steps=S.steps;
-        wf["9"].inputs.scheduler=S.schedulerName||"simple";
-        if(wf["10"]&&wf["10"].class_type==="KSamplerSelect") wf["10"].inputs.sampler_name=S.samplerName||"res_multistep";
-        if(!S.audioOn && wf["14"] && ["t2v","i2v","r2v","keyframes"].includes(S.mode)){
+        wf["8"].inputs.noise_seed=state.seed||0;
+        wf["9"].inputs.steps=state.steps;
+        wf["9"].inputs.scheduler=state.schedulerName||"simple";
+        if(wf["10"]&&wf["10"].class_type==="KSamplerSelect") wf["10"].inputs.sampler_name=state.samplerName||"res_multistep";
+        if(!state.audioOn && wf["14"] && ["t2v","i2v","r2v","keyframes"].includes(state.mode)){
           delete wf["14"].inputs.audio;
         }
-        _insertModelPatches(wf);
-        if(S.livePreview){
+        _insertModelPatches(wf,state);
+        if(state.livePreview){
           wf["lp"]={class_type:"H3StudioTAEH3Preview",inputs:{
             model:wf["5"].inputs.model,
             enabled:true,
-            tiny_vae:S.models.tae||"taeh3.safetensors",
+            tiny_vae:state.models.tae||"taeh3.safetensors",
             max_resolution:768,
             jpeg_quality:85,
             preview_every_n_steps:1,
           },_meta:{title:"Live Preview (TAEH3)"}};
           wf["5"].inputs.model=["lp",0];
         }
-        _applyAutoSave(wf);
-        _insertCacheBust(wf);
+        _applyAutoSave(wf,state);
+        _insertCacheBust(wf,undefined,state);
         return {frames,res};
       };
 
-      const _buildImage=async()=>{
-        const sub=S.imgSub;
-        const refs=(S.imgRefs||[]).slice(0,sub==="edit"?1:9);
+      const _buildImage=async(state=S)=>{
+        const sub=state.imgSub;
+        const refs=(state.imgRefs||[]).slice(0,sub==="edit"?1:9);
         if(sub==="edit"&&!refs.length) throw new Error("Image Edit needs a source image. Drop one into the source slot, or switch to Text to Image.");
         if(sub==="refmix"&&!refs.length) throw new Error("Reference Mix needs at least one reference image. Add images to the slots, or switch to Text to Image.");
-        if(S.imgProfile!=="custom"&&IMG_PROFILE_LORAS[S.imgProfile]){
-          const need=IMG_PROFILE_LORAS[S.imgProfile];
+        if(state.imgProfile!=="custom"&&IMG_PROFILE_LORAS[state.imgProfile]){
+          const need=IMG_PROFILE_LORAS[state.imgProfile];
           if(!_M.loras.length){
-            try{ const r=await fetch("/h3one/models"); const d=await r.json(); _M.loras=d.loras||[]; }catch(e){}
+            try{ const d=await requestJSON("/h3one/models"); _M.loras=d.loras||[]; }catch(e){showError(fmtErr(e));}
           }
           const have=(_M.loras||[]).some(n=>String(n).replace(/\\/g,"/").split("/").pop()===need);
           if(!have){
@@ -3812,7 +3892,7 @@ app.registerExtension({
           }
         }
         if(!_M.text_encoders.length){
-          try{ const r=await fetch("/h3one/models"); const d=await r.json(); _M.text_encoders=d.text_encoders||[]; }catch(e){}
+          try{ const d=await requestJSON("/h3one/models"); _M.text_encoders=d.text_encoders||[]; }catch(e){showError(fmtErr(e));}
         }
         const _imgNeedModels=[];
         for(const need of ["qwen3.5_2b_bf16.safetensors","qwen3.5_4b_bf16.safetensors"]){
@@ -3824,49 +3904,49 @@ app.registerExtension({
         }
         const wf=await _fetchTpl(TEMPLATES.image);
         const _slash=s=>String(s||"").replace(/\\/g,"/");
-        wf["1"].inputs.fl2va_model=_slash(S.models.unetT2V);
-        wf["1"].inputs.ref2va_model=_slash(S.models.unetR2V);
-        wf["1"].inputs.text_encoder=_slash(S.models.clip);
-        wf["1"].inputs.video_vae=_slash(S.models.vaeVideo);
+        wf["1"].inputs.fl2va_model=_slash(state.models.unetT2V);
+        wf["1"].inputs.ref2va_model=_slash(state.models.unetR2V);
+        wf["1"].inputs.text_encoder=_slash(state.models.clip);
+        wf["1"].inputs.video_vae=_slash(state.models.vaeVideo);
         const dir=wf["2"].inputs;
-        dir.prompt=S.prompt||"";
+        dir.prompt=state.prompt||"";
         dir.mode=sub==="refmix"?"reference":"image";
         let w,h;
-        if(S.imgAspect==="Custom"){
-          w=Math.max(32,Math.round((S.imgW||1024)/32)*32);
-          h=Math.max(32,Math.round((S.imgH||1024)/32)*32);
+        if(state.imgAspect==="Custom"){
+          w=Math.max(32,Math.round((state.imgW||1024)/32)*32);
+          h=Math.max(32,Math.round((state.imgH||1024)/32)*32);
         } else {
-          const r=(IMG_ASPECTS[S.imgAspect]||1);
-          const total=Math.max(0.2,Number(S.imgMP)||1)*1e6;
+          const r=(IMG_ASPECTS[state.imgAspect]||1);
+          const total=Math.max(0.2,Number(state.imgMP)||1)*1e6;
           w=Math.round(Math.sqrt(total*r));h=Math.round(Math.sqrt(total/r));
           w=Math.max(32,Math.round(w/32)*32);h=Math.max(32,Math.round(h/32)*32);
         }
-        S.imgLastW=w;S.imgLastH=h;
+        state.imgLastW=w;state.imgLastH=h;
         dir.width=w;dir.height=h;
-        const customAspect=S.imgAspect==="Custom";
-        dir.aspect_ratio=customAspect?"custom":S.imgAspect;
-        dir.megapixels=customAspect?(w*h)/1e6:(Number(S.imgMP)||1);
-        dir.seed=S.seed||0;
-        dir.sampling_profile=S.imgProfile==="custom"?"base_quality_20":(S.imgProfile||"base_quality_20");
+        const customAspect=state.imgAspect==="Custom";
+        dir.aspect_ratio=customAspect?"custom":state.imgAspect;
+        dir.megapixels=customAspect?(w*h)/1e6:(Number(state.imgMP)||1);
+        dir.seed=state.seed||0;
+        dir.sampling_profile=state.imgProfile==="custom"?"base_quality_20":(state.imgProfile||"base_quality_20");
         dir.frame_profile="recommended_5";
         dir.enhance_mode="off";
         dir.adherence=0.85;
         dir.route="auto";
         dir.studio_state="";
-        if(S.imgProfile==="custom"){
+        if(state.imgProfile==="custom"){
           wf["4"]={class_type:"H3StudioSamplingSettings",inputs:{
-            model:["3",0],sampler_name:S.samplerName||"res_multistep",scheduler:S.schedulerName||"simple",
-            steps:S.steps||20,denoise:1.0,shift_video:12.0,shift_audio:3.0,beta_alpha:0.6,beta_beta:0.6,
+            model:["3",0],sampler_name:state.samplerName||"res_multistep",scheduler:state.schedulerName||"simple",
+            steps:state.steps||20,denoise:1.0,shift_video:12.0,shift_audio:3.0,beta_alpha:0.6,beta_beta:0.6,
           },_meta:{title:"Custom Sampling"}};
         }
-        _insertImageModelPatches(wf);
+        _insertImageModelPatches(wf,state);
         let nextId=200;
         const newId=()=>String(nextId++);
         refs.forEach((name,idx)=>{
           const n=idx+1;
           const id=newId();
           wf[id]={class_type:"LoadImage",inputs:{image:name},_meta:{title:"Ref Image "+n}};
-          dir["media_"+n]=[id,0];
+          dir["media_"+n]=_fitMediaLink(wf,[id,0],newId,{width:w,height:h},"Fit Ref Image "+n,state);
           dir["media_type_"+n]="image";
           dir["media_filename_"+n]=name;
           dir["role_"+n]="auto";
@@ -3875,52 +3955,54 @@ app.registerExtension({
         return wf;
       };
 
-      const _buildWorkflow=async()=>{
-        const mode=S.mode;
-        if(mode==="chain") return _buildChain();
-        if(mode==="image") return _buildImage();
+      const _buildWorkflow=async(state=S)=>{
+        const mode=state.mode;
+        if(mode==="chain") return _buildChain(state);
+        if(mode==="image") return _buildImage(state);
         const wf=await _fetchTpl(TEMPLATES[mode]);
-        const {frames}= _patchCommon(wf);
+        const {frames,res}= _patchCommon(wf,state);
         let nextId=200;
         const newId=()=>String(nextId++);
         if(mode==="i2v"){
-          const guides=(S.i2vGuides||[]).map((guide,index)=>({guide,index})).filter(x=>x.guide.enabled!==false).sort((a,b)=>guideFrameIndex(a.guide,frames)-guideFrameIndex(b.guide,frames));
-          if(!S.firstFrame&&!S.lastFrame&&!guides.some(x=>x.guide.img)) throw new Error("I2V needs a First frame, Last frame, or at least one enabled Guide image - or switch to T2V mode.");
-          if(S.firstFrame){
+          const guides=(state.i2vGuides||[]).map((guide,index)=>({guide,index})).filter(x=>x.guide.enabled!==false).sort((a,b)=>guideFrameIndex(a.guide,frames)-guideFrameIndex(b.guide,frames));
+          if(!state.firstFrame&&!state.lastFrame&&!guides.some(x=>x.guide.img)) throw new Error("I2V needs a First frame, Last frame, or at least one enabled Guide image - or switch to T2V mode.");
+          if(state.firstFrame){
             const id=newId();
-            wf[id]={class_type:"LoadImage",inputs:{image:S.firstFrame},_meta:{title:"First Frame"}};
-            wf["6"].inputs.first_frame=[id,0];
+            wf[id]={class_type:"LoadImage",inputs:{image:state.firstFrame},_meta:{title:"First Frame"}};
+            wf["6"].inputs.first_frame=_fitMediaLink(wf,[id,0],newId,res,"Fit First Frame",state);
           }
-          if(S.lastFrame){
+          if(state.lastFrame){
             const id2=newId();
-            wf[id2]={class_type:"LoadImage",inputs:{image:S.lastFrame},_meta:{title:"Last Frame"}};
-            wf["6"].inputs.last_frame=[id2,0];
+            wf[id2]={class_type:"LoadImage",inputs:{image:state.lastFrame},_meta:{title:"Last Frame"}};
+            wf["6"].inputs.last_frame=_fitMediaLink(wf,[id2,0],newId,res,"Fit Last Frame",state);
           }
           let conditioning=["6",0];
           guides.forEach(({guide:g,index})=>{
             if(!g.img) throw new Error(`Guide ${index+1} is enabled but has no image. Add an image, disable it, or remove the guide.`);
             const imageId=newId(), guideId=newId();
             wf[imageId]={class_type:"LoadImage",inputs:{image:g.img},_meta:{title:`Guide ${index+1}`}};
+            const fitted=_fitMediaLink(wf,[imageId,0],newId,res,`Fit Guide ${index+1}`,state);
             wf[guideId]={class_type:"MiniMaxH3AddGuide",inputs:{
               positive:conditioning,
               vae:["3",0],
               latent:["6",1],
-              image:[imageId,0],
+              image:fitted,
               frame_idx:guideFrameIndex(g,frames),
             },_meta:{title:`AddGuide ${index+1}`}};
             conditioning=[guideId,0];
           });
           wf["7"].inputs.conditioning=conditioning;
         } else if(mode==="r2v"){
-          const hasRefs=S.refImages.length||S.refVideos.length||S.refAudios.length;
+          const hasRefs=state.refImages.length||state.refVideos.length||state.refAudios.length;
           if(!hasRefs) throw new Error("R2V needs at least one reference. Add a reference image, video or audio - or switch to T2V mode.");
-          if(S.refImages.length){
+          if(state.refImages.length){
             let firstImgId=null;
-            S.refImages.forEach((name,idx)=>{
+            state.refImages.forEach((name,idx)=>{
               const id=newId();
               wf[id]={class_type:"LoadImage",inputs:{image:name},_meta:{title:"Ref Image"}};
-              wf["6"].inputs[`ref_images.ref_image_${idx}`]=[id,0];
-              if(idx===0) firstImgId=id;
+              const fitted=_fitMediaLink(wf,[id,0],newId,res,"Fit Ref Image",state);
+              wf["6"].inputs[`ref_images.ref_image_${idx}`]=fitted;
+              if(idx===0) firstImgId=fitted;
             });
             // Identity anchor: pin the first reference image as the frame-0
             // keyframe so the shot STARTS from it. Reference videos then provide
@@ -3935,45 +4017,47 @@ app.registerExtension({
               width:Number(wf["6"].inputs.width)||960,
               height:Number(wf["6"].inputs.height)||544,
               anchor:"first",
-              image:[firstImgId,0],
+              image:firstImgId,
+              fit:state.mediaFit||"crop",
             },_meta:{title:"Identity Anchor (frame 0)"}};
             wf["7"].inputs.conditioning=[kfId,0];
           }
-          if(S.refVideos.length){
-            S.refVideos.forEach((entry,idx)=>{
+          if(state.refVideos.length){
+            state.refVideos.forEach((entry,idx)=>{
               const name=(typeof entry==="string")?entry:entry.name;
               const useAudio=!!(entry&&entry.useAudio);
               const lv=newId(),gc=newId();
               wf[lv]={class_type:"LoadVideo",inputs:{file:name,"video-preview":""},_meta:{title:"Ref Video"}};
               wf[gc]={class_type:"GetVideoComponents",inputs:{video:[lv,0]},_meta:{title:"Ref Video Components"}};
-              wf["6"].inputs[`ref_videos.ref_video_${idx}`]=[gc,0];
+              wf["6"].inputs[`ref_videos.ref_video_${idx}`]=_fitMediaLink(wf,[gc,0],newId,res,"Fit Ref Video",state);
               if(useAudio) wf["6"].inputs[`ref_video_audios.ref_video_audio_${idx}`]=[gc,1];
             });
           }
-          if(S.refAudios.length){
-            S.refAudios.forEach((name,idx)=>{
+          if(state.refAudios.length){
+            state.refAudios.forEach((name,idx)=>{
               const id=newId();
               wf[id]={class_type:"LoadAudio",inputs:{audio:name},_meta:{title:"Ref Audio"}};
               const trimId=newId();
-              wf[trimId]={class_type:"H3AudioTrim",inputs:{audio:[id,0],trim_seconds:S.duration},_meta:{title:"Audio Trim"}};
+              wf[trimId]={class_type:"H3AudioTrim",inputs:{audio:[id,0],trim_seconds:state.duration},_meta:{title:"Audio Trim"}};
               wf["6"].inputs[`ref_audios.ref_audio_${idx}`]=[trimId,0];
             });
           }
         } else if(mode==="audio_drive"){
-          if(!S.audioFile) throw new Error("Audio Drive needs an audio track. Drop a file in the Audio track slot - the audio drives the mouth movements and timing.");
-          wf["16"].inputs.audio=S.audioFile;
+          if(!state.audioFile) throw new Error("Audio Drive needs an audio track. Drop a file in the Audio track slot - the audio drives the mouth movements and timing.");
+          wf["16"].inputs.audio=state.audioFile;
           {
             const trimId=newId();
-            wf[trimId]={class_type:"H3AudioTrim",inputs:{audio:["16",0],trim_seconds:S.duration},_meta:{title:"Audio Trim"}};
+            wf[trimId]={class_type:"H3AudioTrim",inputs:{audio:["16",0],trim_seconds:state.duration},_meta:{title:"Audio Trim"}};
             wf["6"].inputs["ref_audios.ref_audio_0"]=[trimId,0];
           }
-          if(S.refImages.length){
+          if(state.refImages.length){
             let firstImgId=null;
-            S.refImages.forEach((name,idx)=>{
+            state.refImages.forEach((name,idx)=>{
               const id=newId();
               wf[id]={class_type:"LoadImage",inputs:{image:name},_meta:{title:"Ref Image"}};
-              wf["6"].inputs[`ref_images.ref_image_${idx}`]=[id,0];
-              if(idx===0) firstImgId=id;
+              const fitted=_fitMediaLink(wf,[id,0],newId,res,"Fit Ref Image",state);
+              wf["6"].inputs[`ref_images.ref_image_${idx}`]=fitted;
+              if(idx===0) firstImgId=fitted;
             });
             const kfId=newId();
             wf[kfId]={class_type:"H3IdentityAnchor",inputs:{
@@ -3984,39 +4068,40 @@ app.registerExtension({
               width:Number(wf["6"].inputs.width)||960,
               height:Number(wf["6"].inputs.height)||544,
               anchor:"first",
-              image:[firstImgId,0],
+              image:firstImgId,
+              fit:state.mediaFit||"crop",
             },_meta:{title:"Identity Anchor (frame 0)"}};
             wf["7"].inputs.conditioning=[kfId,0];
           }
         } else if(mode==="keyframes"){
-          const totalFrames=snapFrames(S.duration);
+          const totalFrames=snapFrames(state.duration);
           const positions=[];
           let imgNum=0;
-          S.kf.forEach((k)=>{
+          state.kf.forEach((k)=>{
             if(!k.img) return;
             imgNum++;
             const id=newId();
             wf[id]={class_type:"LoadImage",inputs:{image:k.img},_meta:{title:`Keyframe ${imgNum}`}};
-            wf["16"].inputs[`keyframe_image_${imgNum}`]=[id,0];
+            wf["16"].inputs[`keyframe_image_${imgNum}`]=_fitMediaLink(wf,[id,0],newId,res,`Fit Keyframe ${imgNum}`,state);
             positions.push(Math.max(1,Math.min(totalFrames,Math.round(k.pos))));
           });
           if(!positions.length) throw new Error("Keyframes mode needs at least one image. Drop an image into a keyframe slot, or switch to another mode.");
           const count=positions.length;
           wf["16"].inputs.keyframe_state=JSON.stringify({count,positions});
         } else if(mode==="extend"){
-          if(!S.extendVideo) throw new Error("Extend needs a source video. Drop a file in the Video to extend slot, or switch to another mode.");
-          wf["16"].inputs.file=S.extendVideo;
+          if(!state.extendVideo) throw new Error("Extend needs a source video. Drop a file in the Video to extend slot, or switch to another mode.");
+          wf["16"].inputs.file=state.extendVideo;
         }
         return wf;
       };
 
-      const _buildChain=async()=>{
+      const _buildChain=async(state=S)=>{
         const section=await _fetchTpl(TEMPLATES.chain);
-        const session=Date.now().toString(36);
-        const clips=S.chainClips;
+        const session=`${Date.now().toString(36)}-${globalThis.crypto?.randomUUID?.().slice(0,8)||Math.random().toString(36).slice(2,10)}`;
+        const clips=state.chainClips;
         const wf={};
         const sharedKeys=["s:1","s:2","s:3","s:4","s:5"];
-        const res=_resolveRes();
+        const res=_resolveRes(state);
         clips.forEach((cl,idx)=>{
           const clone=JSON.parse(JSON.stringify(section));
           const out={};
@@ -4036,15 +4121,15 @@ app.registerExtension({
           const trim=out["c"+idx+":trim"];
           const save=out["c"+idx+":save"];
           const frames=snapFrames(cl.duration);
-          cond.inputs.prompt=_finalPrompt(cl.prompt, idx===0?"t2v":undefined);
+          cond.inputs.prompt=_finalPrompt(cl.prompt, idx===0?"t2v":undefined,state);
           cond.inputs.width=res.width;
           cond.inputs.height=res.height;
           cond.inputs.length=frames;
-          const seed=S.seed||0;
+          const seed=state.seed||0;
           out["c"+idx+":noise"].inputs.noise_seed=seed;
-          out["c"+idx+":sched"].inputs.steps=S.steps;
-          out["c"+idx+":sched"].inputs.scheduler=S.schedulerName||"simple";
-          if(out["c"+idx+":ksel"]&&out["c"+idx+":ksel"].class_type==="KSamplerSelect") out["c"+idx+":ksel"].inputs.sampler_name=S.samplerName||"res_multistep";
+          out["c"+idx+":sched"].inputs.steps=state.steps;
+          out["c"+idx+":sched"].inputs.scheduler=state.schedulerName||"simple";
+          if(out["c"+idx+":ksel"]&&out["c"+idx+":ksel"].class_type==="KSamplerSelect") out["c"+idx+":ksel"].inputs.sampler_name=state.samplerName||"res_multistep";
           save.inputs.filename_prefix="one-node-minimax-h3/chain/"+session;
           save.inputs.clip_index=idx+1;
           out["c"+idx+":savevid"].inputs.filename_prefix=`one-node-minimax-h3/chain/${session}/clip_${idx+1}`;
@@ -4057,8 +4142,8 @@ app.registerExtension({
             out[loadId]={class_type:"MiniMaxH3MotionContextLoadLatent",inputs:{latent_path:"one-node-minimax-h3/chain",clip_index:idx},_meta:{title:"Load Latent"}};
             mc.inputs.context_frames=["c"+(idx-1)+":trim",0];
             mc.inputs.context_latent=[loadId,0];
-            mc.inputs.context_length=S.mcLength;
-            mc.inputs.audio_context_length=S.mcLength;
+            mc.inputs.context_length=state.mcLength;
+            mc.inputs.audio_context_length=state.mcLength;
             trim.inputs.trim_frames=["c"+idx+":mc",1];
             mc.inputs.crop="disabled";
           }
@@ -4068,21 +4153,17 @@ app.registerExtension({
         let modelSrc=["s:2",0];
         let nextId=900;
         const newId=()=>String(nextId++);
-        const actives=S.loras.filter(l=>l.name&&l.enabled!==false);
+        const actives=state.loras.filter(l=>l.name&&l.enabled!==false);
         actives.forEach(lr=>{
           const id=newId();
           wf[id]={class_type:"LoraLoaderModelOnly",inputs:{model:modelSrc,lora_name:lr.name,strength_model:lr.strength},_meta:{title:"LoRA"}};
           modelSrc=[id,0];
         });
         {
-          const useSol=!!S.optSol, useCache=!!S.optCache, useSage=!!S.optSage;
+          const useSol=!!state.optSol, useCache=!!state.optCache, useSage=!!state.optSage;
           const insSol=()=>{
             const sol=newId();
-            wf[sol]={class_type:"SolAttnPatch",inputs:{
-              model:modelSrc,tau:1.3,start_percent:0.2,end_percent:0.9,min_tokens:4096,
-              int8_qk:true,sink_conditioning:"exact_kv_and_rows",morton:false,
-              morton_curve:"2d_frame",int8_pv:true,verbose:true,use_tma:false,dense_blocks:"",
-            },_meta:{title:"Sol-Attn"}};
+            wf[sol]=_solPatch(modelSrc);
             modelSrc=[sol,0];
           };
           const insCache=()=>{
@@ -4108,25 +4189,25 @@ app.registerExtension({
           }
         }
         wf["s:5"].inputs.model=modelSrc;
-        if(S.livePreview){
+        if(state.livePreview){
           wf["s:lp"]={class_type:"H3StudioTAEH3Preview",inputs:{
             model:modelSrc,
             enabled:true,
-            tiny_vae:S.models.tae||"taeh3.safetensors",
+            tiny_vae:state.models.tae||"taeh3.safetensors",
             max_resolution:768,
             jpeg_quality:85,
             preview_every_n_steps:1,
           },_meta:{title:"Live Preview (TAEH3)"}};
           wf["s:5"].inputs.model=["s:lp",0];
         }
-        wf["s:1"].inputs.clip_name=S.models.clip;
-        wf["s:2"].inputs.unet_name=S.models.unetT2V;
-        wf["s:3"].inputs.vae_name=S.models.vaeVideo;
-        wf["s:4"].inputs.vae_name=S.models.vaeAudio;
+        wf["s:1"].inputs.clip_name=state.models.clip;
+        wf["s:2"].inputs.unet_name=state.models.unetT2V;
+        wf["s:3"].inputs.vae_name=state.models.vaeVideo;
+        wf["s:4"].inputs.vae_name=state.models.vaeAudio;
         {
           const fp=JSON.stringify({
-            chain:clips.map(c=>({prompt:_finalPrompt(c.prompt),duration:c.duration})),
-            seed:S.seed||0,steps:S.steps,width:res.width,height:res.height,files:[],
+            chain:clips.map(c=>({prompt:_finalPrompt(c.prompt,undefined,state),duration:c.duration})),
+            seed:state.seed||0,steps:state.steps,width:res.width,height:res.height,files:[],
           });
           wf["s:bust"]={class_type:"H3CacheBust",inputs:{clip:["s:1",0],fingerprint:fp},_meta:{title:"Cache Invalidation"}};
           clips.forEach((_cl,idx)=>{
@@ -4134,42 +4215,42 @@ app.registerExtension({
             if(cond&&cond.inputs&&Array.isArray(cond.inputs.clip)) cond.inputs.clip=["s:bust",0];
           });
         }
-        _applyAutoSave(wf);
+        _applyAutoSave(wf,state);
         return wf;
       };
 
       genBtn.onclick=async()=>{
         if(_generateSubmitting||_upscaleSubmitting) return;
+        try{await _validateCapabilities();}catch(e){showError(fmtErr(e));return;}
         const joining=S.generating;
         const started=Date.now();
-        const wantsLivePreview=!!S.livePreview&&S.mode!=="image";
-        if(wantsLivePreview&&_taeChecked&&!_taeFound){
-          showError(`Live Preview is on but the decoder "${S.models.tae}" was not found in a ComfyUI models/vae_approx folder.\nOpen Settings to pick the Live Preview decoder, download taeh3.safetensors from huggingface.co/Kijai/MiniMax-H3-TAE, or turn Live Preview off.`);
-          return;
-        }
         _generateSubmitting=true;
         genBtn.disabled=true;
-        if(_pendingUploads.size){
-          tx(genBtnLbl,"Waiting for uploads...");
-          setStage("Waiting for media uploads...",2);
-          await _waitForUploads();
+        let snapshot;
+        try{
+          if(_pendingUploads.size){
+            tx(genBtnLbl,"Waiting for uploads...");
+            setStage("Waiting for media uploads...",2);
+            await _waitForUploads();
+          }
+          await _validateCapabilities();
+          snapshot=cloneJSON(S);
+        }catch(e){
+          _generateSubmitting=false;genBtn.disabled=false;showError(fmtErr(e));return;
         }
-        _activeNode=self;
-        _activeShowOutput=showOutput;
-        _activeResetBtn=resetBtn;
-        _activeShowError=showError;
-        _activeSetStage=setStage;
-        _activeShowTime=showTime;
-        _activeShowLatest=showLatest;
+        const wantsLivePreview=!!snapshot.livePreview&&snapshot.mode!=="image";
+        if(wantsLivePreview&&_taeChecked&&!_taeFound){
+          _generateSubmitting=false;genBtn.disabled=false;
+          showError(`Live Preview is on but the decoder "${snapshot.models.tae}" was not found in a ComfyUI models/vae_approx folder.\nOpen Settings to pick the Live Preview decoder, download taeh3.safetensors from huggingface.co/Kijai/MiniMax-H3-TAE, or turn Live Preview off.`);
+          return;
+        }
         if(!joining){
           _upOrig=null;_upResult=null;
           if(_cmpMode) _exitCompare();
           cmpBtn.style.display="none";
-          _activeShownFiles=[];
-          _activeGenStartTs=started;
+          R.shownPrompts.clear();R.shownKeys=[];R.genStartTs=started;
           showTime(0);
-          _activePromptId=null;
-          _batchIds=[];_batchDone=0;_batchCompleted.clear();
+          R.batchIds=[];R.completed.clear();R.finishDone=false;
           S.generating=true;
           genBtn.style.background="linear-gradient(270deg,var(--h3accent),#e8d5c0,#a259ff,var(--h3accent))";
           genBtn.style.backgroundSize="300% 300%";
@@ -4178,46 +4259,48 @@ app.registerExtension({
           stopBtn.style.maxWidth="120px";stopBtn.style.minWidth="";stopBtn.style.width="";stopBtn.style.opacity="1";stopBtn.style.padding="0 14px";stopBtn.style.marginLeft="6px";
           progWrap.style.display="flex";
           self._h3_lpOn=wantsLivePreview;
-          self._h3_lpId=S.mode==="chain"?"s:lp":"lp";
+          self._h3_lpId=snapshot.mode==="chain"?"s:lp":"lp";
         }
         tx(genBtnLbl,joining?"Queueing...":"Generating...");
         setStage(joining?"Building another workflow...":"Building workflow...",3);
         errorBox.style.display="none";
         if(!joining) _showLiveChip(false);
-        const n=Math.max(1,Math.min(4,S.batch||1));
+        const n=Math.max(1,Math.min(4,snapshot.batch||1));
         const pendingIds=Array.from({length:n},(_,i)=>`pending-generate-${started}-${i}`);
-        _batchIds.push(...pendingIds);
+        R.batchIds.push(...pendingIds);
         try{
           for(let i=0;i<n;i++){
-            if(S.randomizeSeed){ S.seed=Math.floor(Math.random()*(H3_SEED_MAX+1)); seedNI._inp.value=String(S.seed); }
-            const wf=await _buildWorkflow();
+            const runState=cloneJSON(snapshot);
+            if(runState.randomizeSeed){
+              runState.seed=Math.floor(Math.random()*(H3_SEED_MAX+1));
+              S.seed=runState.seed;seedNI._inp.value=String(runState.seed);
+            }
+            const wf=await _buildWorkflow(runState);
             const job={
               started,
-              seed:S.seed,
-              mode:S.mode,
-              quality:S.quality,
-              prompt:S.prompt||"",
-              duration:S.duration,
-              resolution:S.mode==="image"?`${S.imgLastW}x${S.imgLastH}`:S.resolution,
-              compareRefs:S.mode==="image"&&["edit","refmix"].includes(S.imgSub)?(S.imgRefs||[]).filter(Boolean).slice(0,S.imgSub==="edit"?1:9):[],
+              seed:runState.seed,
+              mode:runState.mode,
+              quality:runState.quality,
+              prompt:runState.prompt||"",
+              duration:runState.duration,
+              resolution:runState.mode==="image"?`${runState.imgLastW}x${runState.imgLastH}`:runState.resolution,
+              compareRefs:runState.mode==="image"&&["edit","refmix"].includes(runState.imgSub)?(runState.imgRefs||[]).filter(Boolean).slice(0,runState.imgSub==="edit"?1:9):[],
             };
             const body={prompt:wf,client_id:api.clientId,extra_data:{enable_previews:true}};
-            const res=await api.fetchApi("/prompt",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-            const data=await res.json();
+            const data=await requestJSON("/prompt",jsonOptions("POST",body),true);
             if(data.error||!data.prompt_id){
               throw new Error(data.error?.message||JSON.stringify(data.error)||"Unknown error");
             }
             _generationJobs.set(data.prompt_id,job);
-            const pendingIndex=_batchIds.indexOf(pendingIds[i]);
-            if(pendingIndex>=0) _batchIds[pendingIndex]=data.prompt_id;
-            _activePromptId=data.prompt_id;
-            _armFinishWatch();
+            const pendingIndex=R.batchIds.indexOf(pendingIds[i]);
+            if(pendingIndex>=0) R.batchIds[pendingIndex]=data.prompt_id;
+            _promptOwners.set(data.prompt_id,R);_armFinishWatch(R);
           }
-          setStage(`Queued ${_batchIds.length} run${_batchIds.length===1?"":"s"}`,6);
+          setStage(`Queued ${R.batchIds.length} run${R.batchIds.length===1?"":"s"}`,6);
         }catch(e){
-          _batchIds=_batchIds.filter(id=>!pendingIds.includes(id));
-          if(!_batchIds.length) resetBtn();
-          else if(_batchCompleted.size>=_batchIds.length) _finishRun();
+          R.batchIds=R.batchIds.filter(id=>!pendingIds.includes(id));
+          if(!R.batchIds.length) resetBtn();
+          else if(R.completed.size>=R.batchIds.length) _finishRun(R);
           showError(fmtErr(e));
         }finally{
           _generateSubmitting=false;
@@ -4227,10 +4310,9 @@ app.registerExtension({
       };
 
       stopBtn.onclick=async()=>{
-        try{await api.fetchApi("/interrupt",{method:"POST"});}catch(e){}
-        if(_batchIds.length){
-          try{await api.fetchApi("/queue",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({delete:_batchIds})});}catch(e){}
-          _activePromptId=null;
+        try{await requestJSON("/interrupt",{method:"POST"},true);}catch(e){showError(fmtErr(e));}
+        if(R.batchIds.length){
+          try{await requestJSON("/queue",jsonOptions("POST",{delete:R.batchIds}),true);}catch(e){showError(fmtErr(e));}
         }
         resetBtn();
       };
@@ -4245,8 +4327,7 @@ app.registerExtension({
       };
       const _loadModels=async()=>{
         try{
-          const r=await fetch("/h3one/models");
-          const d=await r.json();
+          const d=await requestJSON("/h3one/models");
           _M={diffusion:d.diffusion_models||[],text_encoders:d.text_encoders||[],vaes:d.vaes||[],loras:d.loras||[]};
           const has=(arr,v)=>arr.some(m=>(m||"").toLowerCase()===(v||"").toLowerCase());
           const h3Encoders=_M.text_encoders.filter(name=>/qwen3vl_32b_minimax_h3/i.test(name||""));
@@ -4267,8 +4348,7 @@ app.registerExtension({
           _renderLoras();
           _checkTae();
           try{
-            const sr=await fetch("/h3one/seedvr2_models");
-            const sd=await sr.json();
+            const sd=await requestJSON("/h3one/seedvr2_models");
             const _D=sd.dit||[], _V=sd.vae||[];
             modelDDs.upscaleDit.updateItems(["none"].concat(_D));
             modelDDs.upscaleVae.updateItems(["none"].concat(_V));
@@ -4284,8 +4364,7 @@ app.registerExtension({
       };
       const _loadConfig=async()=>{
         try{
-          const r=await fetch("/h3one/config");
-          const d=await r.json();
+          const d=await requestJSON("/h3one/config");
           if(Array.isArray(d.resolution_presets)){
             _resItems=d.resolution_presets;
             if(S.resolution!=="Custom"&&!_resItems.some(r=>r.label===S.resolution)&&_resItems.length){
@@ -4297,8 +4376,42 @@ app.registerExtension({
           _discTmpl=d.prompt_templates||{};
         }catch(e){console.warn("[H3One] load config:",e);}
       };
+      const _applyCapabilitiesUI=()=>{
+        if(!_capabilities)return;
+        MODES.forEach(m=>{
+          const el=modeEls[m.key],status=_capabilities.modes?.[m.key];
+          if(!el||!status)return;
+          el.disabled=false;
+          el.style.opacity=status.available?"1":".42";
+          el.style.cursor=status.available?"pointer":"not-allowed";
+          el.setAttribute("aria-disabled",status.available?"false":"true");
+          el.title=status.available?(MODE_HINTS[m.key]||""):(status.reason||"Unavailable");
+        });
+        qualDD.updateItems(_qualityItems());
+        upMethodDD.updateItems(_upMethodItems());
+        _syncOptChips();
+        _syncGuideCapability();
+        const current=_capabilities.modes?.[S.mode];
+        if(current&&!current.available)showUnavailable(current.reason||"This mode is unavailable.");
+      };
+      const _loadCapabilities=async()=>{
+        _capabilities=await requestJSON("/h3one/capabilities");
+        _applyCapabilitiesUI();
+        return _capabilities;
+      };
+      const _validateCapabilities=async()=>{
+        if(!_capabilities)await _loadCapabilities();
+        const modeStatus=_capabilities.modes?.[S.mode];
+        if(modeStatus&&!modeStatus.available)throw new Error(modeStatus.reason||`${S.mode} is unavailable`);
+        const needs=[];
+        if(S.quality==="turbo")needs.push("turbo");
+        if(S.mode==="i2v"&&(S.i2vGuides||[]).some(g=>g.enabled!==false))needs.push("guides");
+        if(S.optSol)needs.push("sol");if(S.optCache)needs.push("cache");if(S.optSage)needs.push("sage");
+        for(const name of needs){const f=_capabilities.features?.[name];if(f&&!f.available)throw new Error(f.reason||`${name} is unavailable`);}
+      };
       const _updateFramesLabel=()=>{ tx(framesLbl,`= ${snapFrames(S.duration)} frames @ 24fps`); };
       _updateFramesLabel();
+      _loadCapabilities().catch(e=>console.warn("[H3One] capabilities:",e));
       _loadModels();
       _loadConfig();
       _loadGallery();
@@ -4373,7 +4486,7 @@ app.registerExtension({
         if(settingsOverlay.style.display!=="none"||historyOverlay.style.display!=="none"||libraryOverlay.style.display!=="none"||discoverOverlay.style.display!=="none") return;
         e.preventDefault();e.stopPropagation();
         genBtn.click();
-      });
+      },{signal:life.signal});
 
       document.addEventListener("paste",async(e)=>{
         if(!_mouseOverRoot) return;
@@ -4401,7 +4514,7 @@ app.registerExtension({
             _renderRefs();
           }catch(err){
             console.warn("[H3One] paste upload:",err);
-            _h3ShowError?.("Pasted image upload failed: "+(err?.message||String(err)));
+            showError("Pasted image upload failed: "+(err?.message||String(err)));
           }
         } else if(S.mode==="keyframes"){
           let empty=S.kf.find(k=>!k.img);
@@ -4415,10 +4528,10 @@ app.registerExtension({
             persist();_renderKf();
           }catch(err){
             console.warn("[H3One] paste upload:",err);
-            _h3ShowError?.("Pasted image upload failed: "+(err?.message||String(err)));
+            showError("Pasted image upload failed: "+(err?.message||String(err)));
           }
         }
-      },{capture:true});
+      },{capture:true,signal:life.signal});
 
       // -- DOM widget --------------------------------------------------------
       self.addDOMWidget("h3_ui","div",root,{
@@ -4427,6 +4540,7 @@ app.registerExtension({
         computeSize(){const sh=(typeof LiteGraph!=="undefined"&&LiteGraph.NODE_SLOT_HEIGHT)||20;return[NODE_W,NODE_H+sh*3];},
       });
       {const sh=(typeof LiteGraph!=="undefined"&&LiteGraph.NODE_SLOT_HEIGHT)||20;self.setSize([NODE_W,NODE_H+sh*3]);}
+      persist();
 
       if(!_isVueNodes()){
         requestAnimationFrame(()=>{
@@ -4435,15 +4549,6 @@ app.registerExtension({
         });
       }
 
-      root.addEventListener("pointerdown",()=>{
-        _activeNode=self;
-        _activeShowOutput=showOutput;
-        _activeResetBtn=resetBtn;
-        _activeShowError=showError;
-        _activeSetStage=setStage;
-        _activeShowTime=showTime;
-        _activeShowLatest=showLatest;
-      });
     };
   },
 });
@@ -4453,15 +4558,19 @@ app.registerExtension({
   if(_listenersRegistered) return;
   _listenersRegistered=true;
 
+  const runtimeFor=detail=>_promptOwners.get(detail?.prompt_id)||_executingRuntime;
+
+  api.addEventListener("execution_start",evt=>{const R=_promptOwners.get(evt.detail?.prompt_id);if(R)_executingRuntime=R;});
+  api.addEventListener("executing",evt=>{const R=_promptOwners.get(evt.detail?.prompt_id);if(R)_executingRuntime=R;});
+
   api.addEventListener("progress",(evt)=>{
-    if(!_activeNode) return;
-    if(_activeNode._h3_lpOn) return;
+    const R=runtimeFor(evt.detail);if(!R||R.node?._h3_lpOn)return;
     const {value,max}=evt.detail||{};
-    if(max>0&&_activeSetStage) _activeSetStage("Sampling...",8+Math.round(value/max*86));
+    if(max>0)R.setStage?.("Sampling...",8+Math.round(value/max*86));
   });
 
   api.addEventListener("h3studio-preview",(evt)=>{
-    const node=_activeNode;
+    const node=_executingRuntime?.node;
     if(!node||!node._h3_lpOn) return;
     const d=evt.detail||{};
     if(d.node_id!==node._h3_lpId) return;
@@ -4471,38 +4580,35 @@ app.registerExtension({
   });
 
   api.addEventListener("executed",(evt)=>{
-    if(!_activeNode) return;
     const d=evt.detail;
-    if(!d||!_batchIds.includes(d.prompt_id)) return;
+    const R=_promptOwners.get(d?.prompt_id);if(!R)return;
     const out=d.output;
     if(!out) return;
     const vids=out.videos||out.gifs||null;
-    if(vids&&Array.isArray(vids)&&vids.length&&_activeShowOutput){
-      _activeShowOutput(vids[vids.length-1],d.prompt_id);
-      _activeSetStage?.("Done",97);
+    if(vids&&Array.isArray(vids)&&vids.length){
+      R.showOutput?.(vids[vids.length-1],d.prompt_id);
+      R.setStage?.("Done",97);
     }
     const imgs=out.images||null;
-    if(imgs&&Array.isArray(imgs)&&imgs.length&&_activeShowOutput){
+    if(imgs&&Array.isArray(imgs)&&imgs.length){
       const im=imgs[imgs.length-1];
       const animated=!!(out.animated&&out.animated.length);
-      _activeShowOutput({filename:im.filename,subfolder:im.subfolder||"",type:im.type||"output",kind:animated?"video":"image"},d.prompt_id);
-      _activeSetStage?.("Done",97);
+      R.showOutput?.({filename:im.filename,subfolder:im.subfolder||"",type:im.type||"output",kind:animated?"video":"image"},d.prompt_id);
+      R.setStage?.("Done",97);
     }
   });
 
   api.addEventListener("execution_success",(evt)=>{
     const promptId=evt.detail?.prompt_id;
-    if(promptId&&_batchIds.length&&!_batchIds.includes(promptId)) return;
-    _finishRun(promptId);
+    const R=_promptOwners.get(promptId);if(R)_finishRun(R,promptId);
   });
 
   api.addEventListener("execution_error",(evt)=>{
-    if(!_activeNode) return;
     const d=evt.detail;
-    if(d?.prompt_id&&_batchIds.length&&!_batchIds.includes(d.prompt_id)) return;
+    const R=runtimeFor(d);if(!R)return;
     const msg=fmtErr(d?.exception_message||d?.error||d||"Execution failed.");
-    _activeShowError?.(msg);
-    if(d?.prompt_id) _finishRun(d.prompt_id);
-    else _activeResetBtn?.();
+    R.showError?.(msg);
+    if(d?.prompt_id){R.completed.add(d.prompt_id);_promptOwners.delete(d.prompt_id);}
+    if(R.completed.size>=R.batchIds.length)R.reset?.();
   });
 })();

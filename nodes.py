@@ -1,4 +1,5 @@
 import os
+import asyncio
 import json
 import glob
 import time
@@ -127,6 +128,7 @@ USER_HISTORY_PATH = os.path.join(USER_CONFIG_DIR, "history.json")
 
 _VIDEO_EXTS = (".mp4", ".webm", ".gif", ".mkv", ".mov", ".m4v", ".avi")
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+_AUDIO_EXTS = (".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus")
 _ALLOWED_TEMPLATES = (
     "t2v.json", "i2v.json", "r2v.json", "audio_drive.json",
     "keyframes.json", "video_extend.json", "chain_section.json", "upscale.json",
@@ -213,8 +215,17 @@ def _load_favorites():
 
 def _save_favorites(favset):
     os.makedirs(USER_CONFIG_DIR, exist_ok=True)
-    with open(_favorites_path(), "w", encoding="utf-8") as f:
-        json.dump(sorted(favset), f, ensure_ascii=False, indent=2)
+    tmp = f"{_favorites_path()}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(sorted(favset), f, ensure_ascii=False, indent=2)
+        os.replace(tmp, _favorites_path())
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +323,38 @@ def _safe_join(base, *parts):
     return str(target)
 
 
+def _media_key(filename, subfolder="", file_type="output"):
+    """Stable identity for UI state/history; filenames alone are not unique."""
+    return "|".join((str(file_type or "output"), str(subfolder or "").replace("\\", "/"), str(filename or "")))
+
+
+def _media_kind(filename):
+    low = str(filename or "").lower()
+    if low.endswith(_IMAGE_EXTS):
+        return "image"
+    if low.endswith(_AUDIO_EXTS):
+        return "audio"
+    return "video"
+
+
+def _resolve_media_path(filename, subfolder="", file_type="output"):
+    """Resolve only media managed by this node (output) or ComfyUI temp."""
+    filename = Path(str(filename or "")).name
+    if not filename:
+        raise ValueError("filename required")
+    if file_type == "temp":
+        return _safe_join(str(Path(folder_paths.get_temp_directory()).resolve()), subfolder, filename)
+    if file_type != "output":
+        raise ValueError("unsupported media type")
+    output = Path(_get_output_dir()).resolve()
+    target = Path(_safe_join(str(output), subfolder, filename)).resolve()
+    try:
+        target.relative_to((output / SUBFOLDER).resolve())
+    except Exception:
+        raise ValueError("output file is outside the H3 output folder")
+    return str(target)
+
+
 def _find_ffmpeg():
     try:
         import custom_nodes.ComfyUI_VideoHelperSuite.videohelpersuite.ffmpeg_path as vhs_fp  # noqa
@@ -355,18 +398,10 @@ def _ff():
 def _scan(folder_key, extensions=None):
     exts = extensions or [".safetensors", ".ckpt", ".pt", ".pth", ".gguf"]
     try:
-        bases = folder_paths.get_folder_paths(folder_key)
+        names = folder_paths.get_filename_list(folder_key)
     except Exception:
         return []
-    found = []
-    for base in bases:
-        if not os.path.isdir(base):
-            continue
-        for root, _dirs, files in os.walk(base, followlinks=True):
-            for fn in files:
-                if any(fn.lower().endswith(e) for e in exts):
-                    found.append(os.path.relpath(os.path.join(root, fn), base))
-    return sorted(found)
+    return sorted(name for name in names if any(str(name).lower().endswith(e) for e in exts))
 
 
 def _scan_output_videos():
@@ -385,8 +420,10 @@ def _scan_output_videos():
             found.append({
                 "filename": fn,
                 "subfolder": os.path.relpath(os.path.dirname(full), str(base)).replace("\\", "/"),
+                "type": "output",
                 "mtime": os.path.getmtime(full),
                 "kind": kind,
+                "media_key": _media_key(fn, os.path.relpath(os.path.dirname(full), str(base)).replace("\\", "/"), "output"),
             })
     found.sort(key=lambda x: x["mtime"], reverse=True)
     return found
@@ -408,12 +445,59 @@ async def serve_template(request):
 
 @PromptServer.instance.routes.get("/h3one/models")
 async def get_models(request):
-    return web.json_response({
+    data = await asyncio.to_thread(lambda: {
         "diffusion_models": _scan("diffusion_models"),
         "text_encoders": _scan("text_encoders"),
         "vaes": _scan("vae"),
         "loras": _scan("loras"),
     })
+    return web.json_response(data)
+
+
+@PromptServer.instance.routes.get("/h3one/capabilities")
+async def get_capabilities(request):
+    try:
+        import nodes as comfy_nodes
+        registered = set(comfy_nodes.NODE_CLASS_MAPPINGS)
+    except Exception:
+        registered = set()
+
+    templates = {
+        "t2v": "t2v.json", "i2v": "i2v.json", "r2v": "r2v.json",
+        "audio_drive": "audio_drive.json", "keyframes": "keyframes.json",
+        "extend": "video_extend.json", "chain": "chain_section.json", "image": "image.json",
+    }
+
+    def template_requirements(name):
+        try:
+            with open(os.path.join(NODE_DIR, "workflows", name), "r", encoding="utf-8-sig") as file:
+                workflow = json.load(file)
+            return {node.get("class_type") for node in workflow.values() if node.get("class_type")}
+        except Exception:
+            return set()
+
+    requirements = {mode: template_requirements(name) for mode, name in templates.items()}
+    requirements["chain"].add("MiniMaxH3MotionContextLoadLatent")
+
+    def status(required):
+        missing = [name for name in required if name not in registered]
+        return {"available": not missing, "missing": missing, "reason": "Missing: " + ", ".join(missing) if missing else ""}
+
+    modes = {mode: status(required) for mode, required in requirements.items()}
+    saganaki = "MiniMaxH3MemoryEfficientSolAttentionPatch" in registered
+    kijai = "SolAttnPatch" in registered
+    features = {
+        "sol": {"available": saganaki or kijai, "provider": "saganaki" if saganaki else ("kijai" if kijai else ""),
+                "node_type": "MiniMaxH3MemoryEfficientSolAttentionPatch" if saganaki else ("SolAttnPatch" if kijai else ""),
+                "reason": "Missing a supported SolAttn custom node" if not (saganaki or kijai) else ""},
+        "cache": status(("MiniMaxH3Cache",)),
+        "sage": status(("MiniMaxH3MemoryEfficientSageAttentionPatch",)),
+        "turbo": status(("MiniMaxH3TurboLoRA", "MiniMaxH3TurboSampler")),
+        "guides": status(("MiniMaxH3AddGuide",)),
+        "seedvr2": status(("SeedVR2LoadDiTModel", "SeedVR2LoadVAEModel", "SeedVR2VideoUpscaler")),
+        "rtx_upscale": status(("RTXVideoSuperResolution",)),
+    }
+    return web.json_response({"version": 1, "modes": modes, "features": features})
 
 
 @PromptServer.instance.routes.get("/h3one/seedvr2_models")
@@ -437,16 +521,18 @@ async def get_seedvr2_models(request):
     try:
         found_dit = []
         found_vae = []
-        seed_dir = os.path.join(folder_paths.models_dir, "SEEDVR2")
-        if os.path.isdir(seed_dir):
-            for fn in os.listdir(seed_dir):
-                low = fn.lower()
-                if not low.endswith((".gguf", ".safetensors")):
-                    continue
-                if "vae" in low:
-                    found_vae.append(fn)
-                else:
-                    found_dit.append(fn)
+        try:
+            names = await asyncio.to_thread(folder_paths.get_filename_list, "seedvr2")
+        except Exception:
+            names = []
+        for fn in names:
+            low = str(fn).lower()
+            if not low.endswith((".gguf", ".safetensors")):
+                continue
+            if "vae" in low:
+                found_vae.append(fn)
+            else:
+                found_dit.append(fn)
         dit = sorted(found_dit)
         vae = sorted(found_vae)
         for m in _DIT_DEFAULTS:
@@ -487,17 +573,29 @@ async def upload_file(request):
         filename = field.filename
         if not filename:
             return web.json_response({"ok": False, "error": "no filename"}, status=400)
-        filename = Path(filename).name
-        input_dir = folder_paths.get_input_directory()
-        dest = os.path.join(input_dir, filename)
-        with open(dest, "wb") as f:
+        original = Path(filename).name
+        suffix = Path(original).suffix
+        stem = Path(original).stem[:80] or "upload"
+        filename = f"{stem}_{uuid.uuid4().hex[:10]}{suffix}"
+        input_dir = Path(folder_paths.get_input_directory()).resolve()
+        input_dir.mkdir(parents=True, exist_ok=True)
+        dest = input_dir / filename
+        tmp = input_dir / f".{filename}.{uuid.uuid4().hex}.part"
+        with open(tmp, "wb") as f:
             while True:
                 chunk = await field.read_chunk(65536)
                 if not chunk:
                     break
                 f.write(chunk)
-        return web.json_response({"ok": True, "filename": filename})
+        os.replace(tmp, dest)
+        return web.json_response({"ok": True, "filename": filename, "subfolder": "", "type": "input",
+                                  "kind": _media_kind(filename)})
     except Exception as e:
+        try:
+            if "tmp" in locals() and Path(tmp).exists():
+                Path(tmp).unlink()
+        except Exception:
+            pass
         print(f"[H3One] upload error: {e}")
         return web.json_response({"ok": False, "error": str(e)}, status=500)
 
@@ -507,17 +605,10 @@ async def get_tae_status(request):
     """Reports whether the taeh3 tiny decoder is present in models/vae_approx
     (live preview depends on it; the H3 Studio preview node needs the file)."""
     try:
-        bases = folder_paths.get_folder_paths("vae_approx")
+        names = await asyncio.to_thread(folder_paths.get_filename_list, "vae_approx")
     except Exception:
-        bases = []
-    found = []
-    for base in bases:
-        if not os.path.isdir(base):
-            continue
-        for root, _dirs, files in os.walk(base):
-            for fn in files:
-                if fn.lower() == "taeh3.safetensors":
-                    found.append(os.path.relpath(os.path.join(root, fn), base))
+        names = []
+    found = [name for name in names if Path(str(name)).name.lower() == "taeh3.safetensors"]
     return web.json_response({"ok": True, "found": bool(found), "files": sorted(found)})
 
 
@@ -616,10 +707,13 @@ async def add_history(request):
             "seed": data.get("seed", 0),
             "gen_time": data.get("gen_time", 0),
             "video": data.get("video", ""),
+            "filename": data.get("filename") or data.get("video", ""),
             "subfolder": data.get("subfolder", ""),
             "type": file_type,
             "kind": data.get("kind", "video"),
+            "prompt_id": data.get("prompt_id", ""),
         }
+        entry["media_key"] = _media_key(entry["video"], entry["subfolder"], entry["type"])
         items = _load_history()
         items.insert(0, entry)
         _save_history(items[:MAX_HISTORY])
@@ -644,9 +738,59 @@ async def delete_history(request):
 async def get_gallery(request):
     favs = _load_favorites()
     videos = _scan_output_videos()
+    migrated = set(favs)
     for v in videos:
-        v["favorite"] = v["filename"] in favs
+        key = v["media_key"]
+        if v["filename"] in favs:
+            migrated.add(key)
+            migrated.discard(v["filename"])
+        v["favorite"] = key in migrated
+    if migrated != favs:
+        _save_favorites(migrated)
     return web.json_response({"videos": videos})
+
+
+_staged_cleaned = False
+
+
+def _cleanup_staged_inputs(now=None):
+    cutoff = float(now or time.time()) - 24 * 60 * 60
+    input_dir = Path(folder_paths.get_input_directory()).resolve()
+    if not input_dir.is_dir():
+        return
+    for path in input_dir.glob("h3_src_*"):
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            pass
+
+
+def _stage_media(src, filename):
+    stat = os.stat(src)
+    identity = f"{Path(src).resolve()}|{stat.st_size}|{stat.st_mtime_ns}"
+    digest = hashlib.sha256(identity.encode("utf-8", "replace")).hexdigest()[:20]
+    ext = Path(filename).suffix or ".mp4"
+    input_dir = Path(folder_paths.get_input_directory()).resolve()
+    input_dir.mkdir(parents=True, exist_ok=True)
+    name = f"h3_src_{digest}{ext}"
+    dest = input_dir / name
+    if dest.is_file():
+        return name, True
+    tmp = input_dir / f".{name}.{uuid.uuid4().hex}.part"
+    try:
+        try:
+            os.link(src, tmp)
+        except OSError:
+            shutil.copy2(src, tmp)
+        os.replace(tmp, dest)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+    return name, False
 
 
 @PromptServer.instance.routes.post("/h3one/stage_input")
@@ -659,18 +803,17 @@ async def stage_input(request):
         subfolder = data.get("subfolder", "")
         if not filename:
             return web.json_response({"ok": False, "error": "no filename"}, status=400)
-        if data.get("type") == "temp":
-            src = _safe_join(str(Path(folder_paths.get_temp_directory()).resolve()), subfolder, filename)
-        else:
-            src = _safe_join(_get_output_dir(), subfolder, filename)
+        src = _resolve_media_path(filename, subfolder, data.get("type", "output"))
         if not os.path.isfile(src):
             return web.json_response({"ok": False, "error": "not found"}, status=404)
-        input_dir = Path(folder_paths.get_input_directory()).resolve()
-        os.makedirs(str(input_dir), exist_ok=True)
-        ext = os.path.splitext(filename)[1] or ".mp4"
-        dest_name = f"h3_src_{uuid.uuid4().hex[:10]}{ext}"
-        shutil.copy2(src, os.path.join(str(input_dir), dest_name))
-        return web.json_response({"ok": True, "name": dest_name})
+        global _staged_cleaned
+        if not _staged_cleaned:
+            await asyncio.to_thread(_cleanup_staged_inputs)
+            _staged_cleaned = True
+        dest_name, reused = await asyncio.to_thread(_stage_media, src, filename)
+        return web.json_response({"ok": True, "name": dest_name, "filename": dest_name,
+                                  "subfolder": "", "type": "input", "kind": _media_kind(filename),
+                                  "reused": reused})
     except Exception as e:
         return web.json_response({"ok": False, "error": str(e)}, status=500)
 
@@ -680,13 +823,19 @@ async def toggle_favorite(request):
     try:
         data = await request.json()
         filename = data.get("filename", "")
+        subfolder = data.get("subfolder", "")
+        file_type = data.get("type", "output")
+        if file_type != "output":
+            return web.json_response({"ok": False, "error": "only saved outputs can be favorited"}, status=400)
         fav = bool(data.get("favorite", False))
         if not filename:
             return web.json_response({"ok": False, "error": "no filename"}, status=400)
         favs = _load_favorites()
+        key = _media_key(filename, subfolder, file_type)
         if fav:
-            favs.add(filename)
+            favs.add(key)
         else:
+            favs.discard(key)
             favs.discard(filename)
         _save_favorites(favs)
         return web.json_response({"ok": True})
@@ -702,7 +851,7 @@ async def open_folder(request):
         subfolder = data.get("subfolder", "")
         if not filename:
             return web.json_response({"ok": False, "error": "no filename"})
-        vpath = _safe_join(_get_output_dir(), subfolder, filename)
+        vpath = _resolve_media_path(filename, subfolder, data.get("type", "output"))
         if not os.path.exists(vpath):
             return web.json_response({"ok": False, "error": "file not found"}, status=404)
         if os.name == "nt":
@@ -722,7 +871,7 @@ async def delete_file(request):
         subfolder = data.get("subfolder", "")
         if not filename:
             return web.json_response({"ok": False, "error": "filename required"}, status=400)
-        vpath = _safe_join(_get_output_dir(), subfolder, filename)
+        vpath = _resolve_media_path(filename, subfolder, data.get("type", "output"))
         if not os.path.exists(vpath):
             return web.json_response({"ok": False, "error": "file not found"}, status=404)
         os.remove(vpath)
@@ -792,7 +941,6 @@ class H3OneNode:
     def INPUT_TYPES(cls):
         return {
             "required": {},
-            "optional": {"prompt": ("STRING", {"forceInput": True})},
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
@@ -835,9 +983,8 @@ class H3CacheBust:
     downstream node (conditioning -> sampler -> save) was served stale output.
 
     This node sits upstream of the conditioning node and returns a digest of
-    every input that must invalidate generation: the prompt, all media file
-    names, plus the on-disk content of those files (so replacing a file under
-    the same name also invalidates)."""
+    every input that must invalidate generation. Uploads are uniquely named,
+    so file identity plus size/mtime is sufficient and avoids reading videos."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -879,15 +1026,49 @@ class H3CacheBust:
             if not path or not os.path.isfile(path):
                 continue
             try:
-                with open(path, "rb") as f:
-                    while True:
-                        chunk = f.read(1 << 20)
-                        if not chunk:
-                            break
-                        h.update(chunk)
-            except Exception:
+                stat = os.stat(path)
+                h.update(f"{Path(path).resolve()}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8", "replace"))
+            except OSError:
                 pass
         return h.digest().hex()
+
+
+def _fit_image(image, width, height, mode="crop"):
+    import torch
+    import comfy.utils as _cu
+    image = image[..., :3].movedim(-1, 1)
+    width, height = int(width), int(height)
+    if mode == "stretch":
+        out = _cu.common_upscale(image, width, height, "lanczos", "disabled")
+    elif mode == "fit":
+        src_h, src_w = image.shape[-2:]
+        scale = min(width / src_w, height / src_h)
+        new_w, new_h = max(1, round(src_w * scale)), max(1, round(src_h * scale))
+        scaled = _cu.common_upscale(image, new_w, new_h, "lanczos", "disabled")
+        out = torch.zeros((scaled.shape[0], scaled.shape[1], height, width), dtype=scaled.dtype, device=scaled.device)
+        left, top = (width - new_w) // 2, (height - new_h) // 2
+        out[:, :, top:top + new_h, left:left + new_w] = scaled
+    else:
+        out = _cu.common_upscale(image, width, height, "lanczos", "center")
+    return out.movedim(1, -1)
+
+
+class H3MediaFit:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "image": ("IMAGE",),
+            "width": ("INT", {"default": 1344, "min": 32, "max": 16384, "step": 32}),
+            "height": ("INT", {"default": 768, "min": 32, "max": 16384, "step": 32}),
+            "mode": (["crop", "fit", "stretch"], {"default": "crop"}),
+        }}
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "apply"
+    CATEGORY = "One Node"
+
+    def apply(self, image, width=1344, height=768, mode="crop"):
+        return (_fit_image(image, width, height, mode),)
 
 
 class H3IdentityAnchor:
@@ -909,6 +1090,7 @@ class H3IdentityAnchor:
             },
             "optional": {
                 "image": ("IMAGE",),
+                "fit": (["crop", "fit", "stretch"], {"default": "crop"}),
             },
         }
 
@@ -917,18 +1099,11 @@ class H3IdentityAnchor:
     FUNCTION = "apply"
     CATEGORY = "One Node"
 
-    def apply(self, conditioning, vae, latent, frame_count=124, width=1344, height=768, anchor="first", image=None):
+    def apply(self, conditioning, vae, latent, frame_count=124, width=1344, height=768, anchor="first", image=None, fit="crop"):
         if image is None:
             return (conditioning,)
-        import comfy.utils as _cu
-        # Mirror core MiniMaxH3ImageToVideo's first-frame path exactly: stretch
-        # the image to the target canvas, then VAE-encode (BHWC is handled by
-        # the comfy VAE wrapper). The keyframe latent MUST have the canvas's
-        # latent row count or the packed layout's fixed-row bookkeeping breaks.
-        img = image[:1]
-        img = img[..., :3].movedim(-1, 1)
-        img = _cu.common_upscale(img, int(width), int(height), "lanczos", "disabled")
-        img = img.movedim(1, -1)
+        # The keyframe latent must match the target canvas's latent row count.
+        img = _fit_image(image[:1], width, height, fit)
         z = vae.encode(img)
         idx = 0 if anchor == "first" else max(0, int(frame_count) - 1)
         kf = {"resolved_frame_index": idx, "latent": z}
@@ -976,5 +1151,5 @@ class H3AudioTrim:
         return (audio,)
 
 
-NODE_CLASS_MAPPINGS = {"H3OneNode": H3OneNode, "H3CacheBust": H3CacheBust, "H3IdentityAnchor": H3IdentityAnchor, "H3AudioTrim": H3AudioTrim}
-NODE_DISPLAY_NAME_MAPPINGS = {"H3OneNode": "ALL in ONE MiniMaxH3", "H3CacheBust": "H3 Cache Fingerprint (internal)", "H3IdentityAnchor": "H3 Identity Anchor (internal)", "H3AudioTrim": "H3 Audio Trim (internal)"}
+NODE_CLASS_MAPPINGS = {"H3OneNode": H3OneNode, "H3CacheBust": H3CacheBust, "H3MediaFit": H3MediaFit, "H3IdentityAnchor": H3IdentityAnchor, "H3AudioTrim": H3AudioTrim}
+NODE_DISPLAY_NAME_MAPPINGS = {"H3OneNode": "ALL in ONE MiniMaxH3", "H3CacheBust": "H3 Cache Fingerprint (internal)", "H3MediaFit": "H3 Media Fit (internal)", "H3IdentityAnchor": "H3 Identity Anchor (internal)", "H3AudioTrim": "H3 Audio Trim (internal)"}
